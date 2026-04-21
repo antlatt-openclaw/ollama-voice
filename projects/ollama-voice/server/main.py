@@ -728,4 +728,4 @@ async def websocket_endpoint(ws: WebSocket):
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host=cfg.server.host, port=cfg.server.port, shutdown_timeout=5.0)
+    uvicorn.run(app, host=cfg.server.host, port=cfg.server.port)
