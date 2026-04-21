@@ -11,6 +11,8 @@ from config import TTSConfig
 
 log = logging.getLogger("tts")
 
+MAX_RETRIES = 2
+
 
 def _clean_text(text: str) -> str:
     """Strip markdown and normalize punctuation for TTS synthesis."""
@@ -75,60 +77,71 @@ async def _vibevoice(text: str, cfg: TTSConfig) -> bytes | None:
         "session_hash": session_hash,
     }
 
-    try:
-        async with httpx.AsyncClient(timeout=300.0) as client:
-            # Step 1: Join the generation queue
-            resp = await client.post(
-                f"{cfg.vibevoice_url}/gradio_api/queue/join",
-                json=join_payload,
-            )
-            resp.raise_for_status()
-            if not resp.json().get("event_id"):
-                log.warning("VibeVoice: no event_id in join response")
-                return None
+    for attempt in range(MAX_RETRIES + 1):
+        try:
+            async with httpx.AsyncClient(timeout=300.0) as client:
+                # Step 1: Join the generation queue
+                resp = await client.post(
+                    f"{cfg.vibevoice_url}/gradio_api/queue/join",
+                    json=join_payload,
+                )
+                resp.raise_for_status()
+                if not resp.json().get("event_id"):
+                    log.warning("VibeVoice: no event_id in join response")
+                    return None
 
-            # Step 2: Stream SSE until process_completed
-            async with client.stream(
-                "GET",
-                f"{cfg.vibevoice_url}/gradio_api/queue/data",
-                params={"session_hash": session_hash},
-            ) as sse:
-                sse.raise_for_status()
-                async for line in sse.aiter_lines():
-                    if not line.startswith("data: "):
-                        continue
-                    try:
-                        msg = json.loads(line[6:])
-                    except json.JSONDecodeError:
-                        continue
+                # Step 2: Stream SSE until process_completed
+                async with client.stream(
+                    "GET",
+                    f"{cfg.vibevoice_url}/gradio_api/queue/data",
+                    params={"session_hash": session_hash},
+                ) as sse:
+                    sse.raise_for_status()
+                    async for line in sse.aiter_lines():
+                        if not line.startswith("data: "):
+                            continue
+                        try:
+                            msg = json.loads(line[6:])
+                        except json.JSONDecodeError:
+                            continue
 
-                    if msg.get("msg") != "process_completed":
-                        continue
+                        if msg.get("msg") != "process_completed":
+                            continue
 
-                    out_data = msg.get("output", {}).get("data", [])
-                    # Returns: [streaming_file, podcast_file, log, value]
-                    podcast_info = out_data[1] if len(out_data) > 1 else None
+                        out_data = msg.get("output", {}).get("data", [])
+                        # Returns: [streaming_file, podcast_file, log, value]
+                        podcast_info = out_data[1] if len(out_data) > 1 else None
 
-                    # Unwrap {"__type__": "update", "value": {...}}
-                    if isinstance(podcast_info, dict) and podcast_info.get("__type__") == "update":
-                        podcast_info = podcast_info.get("value")
+                        # Unwrap {"__type__": "update", "value": {...}}
+                        if isinstance(podcast_info, dict) and podcast_info.get("__type__") == "update":
+                            podcast_info = podcast_info.get("value")
 
-                    if not (podcast_info and isinstance(podcast_info, dict)):
-                        log.warning("VibeVoice: no podcast file in response")
-                        return None
+                        if not (podcast_info and isinstance(podcast_info, dict)):
+                            log.warning("VibeVoice: no podcast file in response")
+                            return None
 
-                    file_url = podcast_info.get("url", "")
-                    if not file_url:
-                        return None
-                    if file_url.startswith("/"):
-                        file_url = f"{cfg.vibevoice_url}{file_url}"
+                        file_url = podcast_info.get("url", "")
+                        if not file_url:
+                            return None
+                        if file_url.startswith("/"):
+                            file_url = f"{cfg.vibevoice_url}{file_url}"
 
-                    audio_resp = await client.get(file_url)
-                    audio_resp.raise_for_status()
-                    return await _audio_to_pcm(audio_resp.content, target_rate=cfg.output_sample_rate)
+                        audio_resp = await client.get(file_url)
+                        audio_resp.raise_for_status()
+                        return await _audio_to_pcm(audio_resp.content, target_rate=cfg.output_sample_rate)
 
-    except Exception as e:
-        log.error("VibeVoice error: %s", e)
+        except httpx.HTTPStatusError as e:
+            if e.response.status_code in (429, 502, 503, 504) and attempt < MAX_RETRIES:
+                wait = 2 ** attempt
+                log.warning("VibeVoice error %d (attempt %d/%d), retrying in %ds...",
+                            e.response.status_code, attempt + 1, MAX_RETRIES + 1, wait)
+                await asyncio.sleep(wait)
+                continue
+            log.error("VibeVoice error: %s", e)
+            return None
+        except Exception as e:
+            log.error("VibeVoice error: %s", e)
+            return None
     return None
 
 

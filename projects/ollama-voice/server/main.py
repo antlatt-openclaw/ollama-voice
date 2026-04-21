@@ -3,7 +3,6 @@
 import asyncio
 import json
 import logging
-import re
 import time
 import uuid
 from enum import Enum
@@ -162,21 +161,30 @@ async def generate_response(ws: WebSocket, text: str, history: list[dict] | None
                 return False
         return True
 
-    # Sentence extraction regex: matches text ending with .!? followed by whitespace
-    SENTENCE_RE = re.compile(r'([^.!?]*[.!?]+)\s+')
+    # Sentence extraction: word-based with abbreviation handling
+    # to avoid splitting on abbreviations like "Dr.", "Mr.", "e.g."
+    ABBREVIATIONS = {
+        'mr', 'mrs', 'ms', 'dr', 'prof', 'st', 'ave', 'blvd', 'rd', 'inc',
+        'ltd', 'co', 'e.g', 'i.e', 'etc', 'vs', 'a.m', 'p.m', 'am', 'pm',
+        'no', 'nos', 'vol', 'vols', 'fig', 'figs', 'et', 'al', 'jan', 'feb',
+        'mar', 'apr', 'jun', 'jul', 'aug', 'sep', 'oct', 'nov', 'dec'
+    }
 
     def extract_sentences(text: str) -> tuple[list[str], str]:
-        """Extract complete sentences from text, returning (sentences, remainder)."""
+        """Extract complete sentences, handling common abbreviations."""
         sentences = []
-        remainder = text
-        while True:
-            match = SENTENCE_RE.match(remainder)
-            if not match:
-                break
-            sentence = match.group(1).strip()
-            if sentence:
-                sentences.append(sentence)
-            remainder = remainder[match.end():]
+        current = []
+        words = text.split()
+
+        for word in words:
+            current.append(word)
+            if word[-1] in '.!?':
+                clean = word.rstrip('.!?').lower()
+                if clean not in ABBREVIATIONS:
+                    sentences.append(' '.join(current))
+                    current = []
+
+        remainder = ' '.join(current)
         return sentences, remainder
 
     await _locked_send_json(ResponseStartMessage(text=""))
@@ -259,8 +267,10 @@ async def generate_response(ws: WebSocket, text: str, history: list[dict] | None
 
         if audio and current_state != ServerState.INTERRUPTED:
             if not audio_started:
-                duration_ms = int(len(audio) / (cfg.tts.output_sample_rate * 2) * 1000)
-                await _locked_send_json(AudioStartMessage(duration_ms=duration_ms))
+                # For continuous streaming, total duration is unknown until all
+                # audio is generated. Clients should handle duration_ms=0 as
+                # "streaming, duration unknown".
+                await _locked_send_json(AudioStartMessage(duration_ms=0))
                 audio_started = True
 
             success = await _locked_send_audio(audio)
