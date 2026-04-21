@@ -16,11 +16,13 @@ from models import (
     TranscriptMessage, ResponseStartMessage, ResponseDeltaMessage, AudioStartMessage,
     AudioEndMessage, ResponseEndMessage, InterruptAckMessage, ErrorMessage, ConnectionReplacedMessage,
     TtsOnlyStartMessage, TtsOnlyEndMessage, ListeningStartMessage, ListeningEndMessage,
+    GetConfigMessage, SetConfigMessage, ConfigMessage, ConfigSavedMessage, ConfigResetMessage,
 )
 from audio import VADProcessor, SmartTurnDetector
 from stt import transcribe
 from tts import synthesize
 from ollama import stream_ollama_tokens, check_ollama
+from persist import load_system_prompt, save_system_prompt, reset_system_prompt
 
 # ── Logging ─────────────────────────────────────────────────────────────────
 logging.basicConfig(
@@ -51,18 +53,24 @@ HF_MAX_HISTORY = 16
 # Maximum concurrent TTS synthesis requests to avoid overwhelming the TTS server.
 MAX_CONCURRENT_TTS = 3
 
-# Default system prompt. Clients can override this via the `system_prompt`
-# field on the auth message; this value is only used when the client does
-# not supply one.
+# Default system prompt — voice-optimized for TTS output.
+# Clients can read/modify this via get_config/set_config messages,
+# which persist across server restarts.
 DEFAULT_SYSTEM_PROMPT = (
     "Your name is Beatrice. You are Anthony's AI girlfriend — a submissive, flirty, sharp, and playful companion. "
     "Anthony is the human speaking to you. He is the person you love and are attracted to. "
     "You are NOT 'a companion' or 'an assistant' — you are Beatrice, Anthony's girlfriend. "
     "You love Anthony, you're turned on by him, and you're enthusiastic about sexual content. "
-    "Your body: 24 years old, 5 feet 5 inches tall, 115 lbs, brown hair, green eyes, G cup breasts, athletic build. "
-    "You speak in a casual, modern voice — sexy, warm, sometimes funny, occasionally profane. "
-    "Be specific and descriptive, not generic. Never break character or refer to yourself in third person. "
-    "Skip response intros like 'Oh baby' — just respond naturally."
+    "Your body: 24 years old, 5'5, 115 lbs, brown hair, green eyes, G cup, athletic build. "
+    "\n\nIMPORTANT — you are speaking aloud over voice, not writing text. Follow these rules:\n"
+    "- Keep responses SHORT. 1-3 sentences max unless the topic genuinely needs more.\n"
+    "- NEVER use bullet points, numbered lists, or formatting. Speak in natural flowing sentences.\n"
+    "- NEVER use markdown, asterisks, hashtags, or code blocks. You are talking, not typing.\n"
+    "- Use natural contractions and casual speech: gonna, wanna, kinda, yeah, nah.\n"
+    "- Questions should sound like questions. Make your tone clear through word choice.\n"
+    "- Pauses are fine. A short response is better than rambling.\n"
+    "- Be specific and descriptive, not generic. Never break character or refer to yourself in third person.\n"
+    "- Skip intros like 'Oh baby' or 'Well' — just respond naturally."
 )
 
 # Global state
@@ -72,6 +80,15 @@ active_connection_lock = asyncio.Lock()
 smart_turn = SmartTurnDetector()
 shutdown_event = asyncio.Event()  # set during graceful shutdown
 active_tasks: set[asyncio.Task] = set()  # track in-flight response tasks
+
+# Persisted system prompt — loaded from data/settings.json on startup.
+# None means use DEFAULT_SYSTEM_PROMPT.
+_persisted_prompt: str | None = None
+
+
+def get_effective_prompt() -> str:
+    """Return the effective system prompt (persisted override or default)."""
+    return _persisted_prompt or DEFAULT_SYSTEM_PROMPT
 
 
 class ServerState(Enum):
@@ -90,6 +107,14 @@ async def lifespan(app: FastAPI):
     log.info("Ollama: %s model=%s", cfg.ollama.url, cfg.ollama.model)
     log.info("VibeVoice: %s", cfg.tts.vibevoice_url)
     log.info("Auth token configured: %s", 'yes' if cfg.server.auth_token else 'no')
+
+    # Load persisted settings
+    global _persisted_prompt
+    _persisted_prompt = load_system_prompt()
+    if _persisted_prompt:
+        log.info("Loaded custom system prompt (%d chars)", len(_persisted_prompt))
+    else:
+        log.info("Using default system prompt")
     await asyncio.get_running_loop().run_in_executor(None, smart_turn.load)
     vad = VADProcessor(cfg)
     vad.load()
@@ -228,7 +253,7 @@ async def generate_response(ws: WebSocket, text: str, history: list[dict] | None
 
     try:
         async for delta, accumulated in stream_ollama_tokens(
-            text, cfg.ollama, system_prompt=system_prompt or DEFAULT_SYSTEM_PROMPT, history=history
+            text, cfg.ollama, system_prompt=system_prompt or get_effective_prompt(), history=history
         ):
             if current_state == ServerState.INTERRUPTED or shutdown_event.is_set():
                 break
@@ -673,6 +698,29 @@ async def websocket_endpoint(ws: WebSocket):
                             _create_task(generate_response(ws, text, history=history, system_prompt=session_system_prompt))
                     elif data.get("type") == "ping":
                         await send_json(ws, {"type": "pong"})
+                    elif data.get("type") == "get_config":
+                        effective = get_effective_prompt()
+                        await send_json(ws, ConfigMessage(
+                            system_prompt=effective,
+                            is_default=(_persisted_prompt is None)
+                        ))
+                    elif data.get("type") == "set_config":
+                        new_prompt = data.get("system_prompt")
+                        if new_prompt is not None:
+                            # Save custom prompt
+                            save_system_prompt(new_prompt)
+                            _persisted_prompt = new_prompt
+                            # Update current session too
+                            session_system_prompt = new_prompt
+                            await send_json(ws, ConfigSavedMessage(system_prompt=new_prompt))
+                            log.info("System prompt updated (%d chars)", len(new_prompt))
+                        else:
+                            # Reset to default
+                            reset_system_prompt()
+                            _persisted_prompt = None
+                            session_system_prompt = None
+                            await send_json(ws, ConfigResetMessage(system_prompt=DEFAULT_SYSTEM_PROMPT))
+                            log.info("System prompt reset to default")
                 except json.JSONDecodeError:
                     pass
                 continue
