@@ -42,10 +42,11 @@ async def stream_ollama_tokens(
             ) as resp:
                 resp.raise_for_status()
                 accumulated = ""
+                line_iter = resp.aiter_lines()
                 while True:
                     try:
                         line = await asyncio.wait_for(
-                            resp.aiter_lines().__anext__(), timeout=PER_CHUNK_TIMEOUT
+                            line_iter.__anext__(), timeout=PER_CHUNK_TIMEOUT
                         )
                     except asyncio.TimeoutError:
                         log.error("Ollama SSE timed out: no token received in %.0fs", PER_CHUNK_TIMEOUT)
