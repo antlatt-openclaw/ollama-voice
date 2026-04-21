@@ -70,6 +70,8 @@ active_connection: WebSocket | None = None
 active_connection_id: str | None = None
 active_connection_lock = asyncio.Lock()
 smart_turn = SmartTurnDetector()
+shutdown_event = asyncio.Event()  # set during graceful shutdown
+active_tasks: set[asyncio.Task] = set()  # track in-flight response tasks
 
 
 class ServerState(Enum):
@@ -94,7 +96,31 @@ async def lifespan(app: FastAPI):
     app.state.vad = vad
     log.info("VAD model loaded")
     yield
-    log.info("Shutting down")
+    # ── Graceful shutdown ──────────────────────────────────────────────
+    log.info("Shutting down — signalling active tasks")
+    shutdown_event.set()
+
+    # Cancel tracked response tasks
+    for task in active_tasks:
+        if not task.done():
+            task.cancel()
+    if active_tasks:
+        log.info("Waiting for %d task(s) to finish...", len(active_tasks))
+        await asyncio.gather(*active_tasks, return_exceptions=True)
+        log.info("All tasks finished")
+
+    # Close active WebSocket so client doesn't hang
+    async with active_connection_lock:
+        if active_connection is not None:
+            log.info("Closing active WebSocket (connection %s)", active_connection_id)
+            try:
+                await active_connection.close(code=1001, reason="Server shutting down")
+            except Exception:
+                pass
+            active_connection = None
+            active_connection_id = None
+
+    log.info("Shutdown complete")
 
 
 app = FastAPI(title="Ollama Voice Server", lifespan=lifespan)
@@ -204,7 +230,7 @@ async def generate_response(ws: WebSocket, text: str, history: list[dict] | None
         async for delta, accumulated in stream_ollama_tokens(
             text, cfg.ollama, system_prompt=system_prompt or DEFAULT_SYSTEM_PROMPT, history=history
         ):
-            if current_state == ServerState.INTERRUPTED:
+            if current_state == ServerState.INTERRUPTED or shutdown_event.is_set():
                 break
 
             full_response = accumulated
@@ -222,8 +248,8 @@ async def generate_response(ws: WebSocket, text: str, history: list[dict] | None
     except Exception as e:
         log.error("LLM streaming error: %s", e)
 
-    if current_state == ServerState.INTERRUPTED:
-        log.debug("Interrupted during LLM, cancelling %d TTS tasks", len(tts_tasks))
+    if current_state == ServerState.INTERRUPTED or shutdown_event.is_set():
+        log.debug("Interrupted/shutdown during LLM, cancelling %d TTS tasks", len(tts_tasks))
         for task in tts_tasks:
             if not task.done():
                 task.cancel()
@@ -248,7 +274,7 @@ async def generate_response(ws: WebSocket, text: str, history: list[dict] | None
     audio_started = False
 
     for task in tts_tasks:
-        if current_state == ServerState.INTERRUPTED:
+        if current_state == ServerState.INTERRUPTED or shutdown_event.is_set():
             # Cancel remaining tasks to avoid wasting TTS server resources
             for remaining in tts_tasks[tts_tasks.index(task):]:
                 if not remaining.done():
@@ -613,7 +639,7 @@ async def websocket_endpoint(ws: WebSocket):
         log.info("Hands-free processor started")
 
     try:
-        while True:
+        while not shutdown_event.is_set():
             log.debug("Waiting for message from %s", conn_id)
             msg = await ws.receive()
             log.debug("Received message type: %s", msg.get('type'))
@@ -702,4 +728,4 @@ async def websocket_endpoint(ws: WebSocket):
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host=cfg.server.host, port=cfg.server.port)
+    uvicorn.run(app, host=cfg.server.host, port=cfg.server.port, shutdown_timeout=5.0)
