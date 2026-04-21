@@ -109,7 +109,8 @@ class WebSocketService {
         },
       );
 
-      // Send auth as first message
+      // Send auth as first message — system_prompt is NOT sent here;
+      // the server manages the prompt via get_config/set_config.
       final authPayload = <String, dynamic>{
         'type': 'auth',
         'token': authToken,
@@ -117,7 +118,7 @@ class WebSocketService {
         'mode': mode,
       };
       if (agent != null) authPayload['agent'] = agent;
-      if (systemPrompt != null) authPayload['system_prompt'] = systemPrompt;
+      // Note: system_prompt intentionally omitted — use set_config instead
       final authMsg = jsonEncode(authPayload);
       print('[WebSocket] Sending auth message...');
       _channel!.sink.add(authMsg);

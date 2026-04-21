@@ -94,7 +94,6 @@ class VoiceConnectionState extends ChangeNotifier {
       authToken: _configService.authToken,
       agent: _configService.activeAgent,
       mode: _configService.handsFreeEnabled ? 'hands_free' : 'ptt',
-      systemPrompt: _configService.systemPrompt,
     );
 
     try {
