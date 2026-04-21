@@ -49,6 +49,9 @@ VAD_CHUNK_SIZE = 1024
 # Maximum conversation history entries kept per hands-free session.
 HF_MAX_HISTORY = 16
 
+# Maximum concurrent TTS synthesis requests to avoid overwhelming the TTS server.
+MAX_CONCURRENT_TTS = 3
+
 # Default system prompt. Clients can override this via the `system_prompt`
 # field on the auth message; this value is only used when the client does
 # not supply one.
@@ -182,6 +185,12 @@ async def generate_response(ws: WebSocket, text: str, history: list[dict] | None
     full_response = ""
     text_buffer = ""
     tts_tasks = []
+    tts_semaphore = asyncio.Semaphore(MAX_CONCURRENT_TTS)
+
+    async def _synthesize_with_limit(text: str) -> bytes | None:
+        """Synthesize with concurrency limit to avoid overwhelming TTS server."""
+        async with tts_semaphore:
+            return await synthesize(text, cfg.tts)
 
     try:
         async for delta, accumulated in stream_ollama_tokens(
@@ -200,7 +209,7 @@ async def generate_response(ws: WebSocket, text: str, history: list[dict] | None
                 if current_state == ServerState.INTERRUPTED:
                     break
                 log.info("Queueing TTS for sentence (%d chars): %.80s", len(sentence), sentence)
-                task = asyncio.create_task(synthesize(sentence, cfg.tts))
+                task = asyncio.create_task(_synthesize_with_limit(sentence))
                 tts_tasks.append(task)
     except Exception as e:
         log.error("LLM streaming error: %s", e)
@@ -210,6 +219,8 @@ async def generate_response(ws: WebSocket, text: str, history: list[dict] | None
         for task in tts_tasks:
             if not task.done():
                 task.cancel()
+        if tts_tasks:
+            await asyncio.gather(*tts_tasks, return_exceptions=True)
         current_state = ServerState.IDLE
         return None
 
@@ -230,6 +241,12 @@ async def generate_response(ws: WebSocket, text: str, history: list[dict] | None
 
     for task in tts_tasks:
         if current_state == ServerState.INTERRUPTED:
+            # Cancel remaining tasks to avoid wasting TTS server resources
+            for remaining in tts_tasks[tts_tasks.index(task):]:
+                if not remaining.done():
+                    remaining.cancel()
+            if tts_tasks:
+                await asyncio.gather(*tts_tasks, return_exceptions=True)
             break
 
         try:
@@ -255,6 +272,12 @@ async def generate_response(ws: WebSocket, text: str, history: list[dict] | None
 
     if current_state == ServerState.INTERRUPTED:
         log.debug("Interrupted during TTS, skipping ResponseEnd")
+        # Cancel any remaining tasks
+        for task in tts_tasks:
+            if not task.done():
+                task.cancel()
+        if tts_tasks:
+            await asyncio.gather(*tts_tasks, return_exceptions=True)
         current_state = ServerState.IDLE
         return None
 
