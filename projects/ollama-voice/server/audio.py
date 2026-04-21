@@ -37,15 +37,22 @@ class VADProcessor:
         """Run VAD on a single chunk and return raw speech probability (no state changes).
 
         Silero VAD requires exactly 512 samples at 16 kHz (1024 bytes).
-        If the chunk is a different size it is silently discarded (returns 0.0).
+        Chunks that are too short are padded with last sample; chunks that are
+        too long are truncated. Only exact 1024-byte chunks are optimal.
         """
         if self.model is None:
             return 0.0
         EXPECTED_BYTES = 1024  # 512 int16 samples
-        if len(pcm_bytes) != EXPECTED_BYTES:
-            # Chunk size mismatch — don't crash, just skip
-            log.warning("[VAD] get_speech_prob: unexpected chunk size %d bytes (expected %d), skipping", len(pcm_bytes), EXPECTED_BYTES)
-            return 0.0
+        if len(pcm_bytes) < EXPECTED_BYTES:
+            # Pad with last sample value to avoid zero-silence artifacts
+            last_sample = pcm_bytes[-2:] if len(pcm_bytes) >= 2 else b'\x00\x00'
+            padding = last_sample * ((EXPECTED_BYTES - len(pcm_bytes)) // 2)
+            remainder = (EXPECTED_BYTES - len(pcm_bytes)) % 2
+            pcm_bytes = pcm_bytes + padding + (b'\x00' * remainder)
+        elif len(pcm_bytes) > EXPECTED_BYTES:
+            log.warning("[VAD] get_speech_prob: chunk too long (%d bytes), truncating to %d",
+                        len(pcm_bytes), EXPECTED_BYTES)
+            pcm_bytes = pcm_bytes[:EXPECTED_BYTES]
         try:
             samples_np = np.frombuffer(pcm_bytes, dtype=np.int16).astype(np.float32) / 32768.0
             if torch is not None:
@@ -81,13 +88,6 @@ class VADProcessor:
             excess = len(self._audio_buffer) - MAX_BYTES
             del self._audio_buffer[:excess]
             log.warning("VAD buffer overflow, dropped %d bytes of oldest audio", excess)
-
-    def add_speech_chunk(self, pcm_bytes: bytes) -> bool:
-        """Add chunk only if VAD detects speech. Returns True if added."""
-        if self.get_speech_prob(pcm_bytes) >= self.cfg.vad.speech_threshold:
-            self._audio_buffer.extend(pcm_bytes)
-            return True
-        return False
 
 
 def wav_header(data_length: int, sample_rate: int, channels: int = 1, bits: int = 16) -> bytes:
