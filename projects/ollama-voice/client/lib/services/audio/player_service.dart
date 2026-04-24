@@ -1,6 +1,5 @@
 import 'dart:async';
 import 'dart:io';
-import 'dart:typed_data';
 import 'package:flutter/foundation.dart';
 import 'package:just_audio/just_audio.dart';
 import 'package:audio_session/audio_session.dart';
@@ -9,6 +8,8 @@ import 'package:path_provider/path_provider.dart';
 class PlayerService extends ChangeNotifier {
   final AudioPlayer _player = AudioPlayer();
   StreamSubscription? _playerStateSub;
+  StreamSubscription? _audioSessionSub;
+  Timer? _playbackEndTimer;
 
   ConcatenatingAudioSource? _playlist;
   bool _playlistActive = false;
@@ -19,31 +20,95 @@ class PlayerService extends ChangeNotifier {
   static const int _maxBufferBytes = 5 * 1024 * 1024; // 5 MB
 
   static const int _outputSampleRate = 24000;
+  // Delay before re-enabling mic after playback ends (prevents echo)
+  static const int _micReenableDelayMs = 200;
 
   bool _isInitialized = false;
   bool _isInterrupted = false;
   bool _isMuted = false;
+  bool _autoPlay = true; // Auto-play responses by default in hands-free mode
   double _speed = 1.0;
+
+  // ── Audio routing ────────────────────────────────────────────────────────
+  // When true, route audio to earpiece instead of speaker (proximity sensor).
+  bool _useEarpiece = false;
+
+  // ── Playback completion tracking ─────────────────────────────────────────
+  final StreamController<bool> _playbackCompleteStream = StreamController.broadcast();
 
   bool get isPlaying => _player.playing;
   bool get isMuted => _isMuted;
+  bool get autoPlay => _autoPlay;
   double get speed => _speed;
+  bool get useEarpiece => _useEarpiece;
+
+  /// Stream that emits true when playback completes naturally (all sentences done).
+  Stream<bool> get playbackCompleteStream => _playbackCompleteStream.stream;
+
+  /// Callback invoked after playback ends + mic re-enable delay (for hands-free mode).
+  VoidCallback? onPlaybackEnded;
 
   Future<void> init() async {
     if (_isInitialized) return;
     final session = await AudioSession.instance;
     await session.configure(const AudioSessionConfiguration.speech());
+
+    _audioSessionSub = session.interruptionEventStream.listen((_) {
+      // Handle audio interruptions (e.g., phone calls)
+      _configureAudioSession();
+    });
+
     _playerStateSub?.cancel();
     _playerStateSub = _player.playerStateStream.listen((state) {
       if (state.processingState == ProcessingState.completed) {
-        // Playlist finished naturally — reset so the PTT button returns to idle.
         _player.stop();
         _playlist = null;
         _playlistActive = false;
+        if (!_playbackCompleteStream.isClosed) {
+          _playbackCompleteStream.add(true);
+        }
+      }
+      // When playback stops (naturally or by user), schedule mic re-enable.
+      if (!state.playing && _playbackEndTimer == null && !_isInterrupted) {
+        _playbackEndTimer = Timer(
+          const Duration(milliseconds: _micReenableDelayMs),
+          () {
+            _playbackEndTimer = null;
+            onPlaybackEnded?.call();
+          },
+        );
       }
       notifyListeners();
     });
     _isInitialized = true;
+  }
+
+  /// Configure audio session based on current routing settings.
+  Future<void> _configureAudioSession() async {
+    final session = await AudioSession.instance;
+    if (_useEarpiece) {
+      await session.configure(const AudioSessionConfiguration.speech().copyWith(
+        androidAudioAttributes: AndroidAudioAttributes(
+          contentType: AndroidAudioContentType.speech,
+          usage: AndroidAudioUsage.voiceCommunication,
+        ),
+      ));
+    } else {
+      await session.configure(const AudioSessionConfiguration.speech());
+    }
+  }
+
+  /// Enable/disable auto-play. In hands-free mode, this should be true.
+  void setAutoPlay(bool value) {
+    _autoPlay = value;
+    notifyListeners();
+  }
+
+  /// Route audio to earpiece (true) or speaker (false).
+  void setUseEarpiece(bool value) {
+    _useEarpiece = value;
+    _configureAudioSession();
+    notifyListeners();
   }
 
   // ── WAV helpers ───────────────────────────────────────────────────────────
@@ -77,6 +142,8 @@ class PlayerService extends ChangeNotifier {
   // ── Response lifecycle ────────────────────────────────────────────────────
 
   Future<void> startResponse() async {
+    _playbackEndTimer?.cancel();
+    _playbackEndTimer = null;
     _isInterrupted = false;
     await _player.stop();
     _playlist = ConcatenatingAudioSource(children: []);
@@ -100,8 +167,11 @@ class PlayerService extends ChangeNotifier {
     _audioBufferLength += data.length;
   }
 
+  /// Play buffered audio. If [autoPlay] is false, the audio is buffered but
+  /// not played until [playBuffered] is called explicitly or autoPlay is enabled.
   Future<void> playBuffered() async {
     if (!_isInitialized || _audioBufferLength == 0 || _isInterrupted) return;
+    if (!_autoPlay) return;
 
     final allPcm = Uint8List(_audioBufferLength);
     int offset = 0;
@@ -172,6 +242,8 @@ class PlayerService extends ChangeNotifier {
 
   Future<void> interrupt() async {
     _isInterrupted = true;
+    _playbackEndTimer?.cancel();
+    _playbackEndTimer = null;
     await _player.stop();
     _playlist = null;
     _playlistActive = false;
@@ -223,7 +295,11 @@ class PlayerService extends ChangeNotifier {
   @override
   void dispose() {
     _playerStateSub?.cancel();
+    _audioSessionSub?.cancel();
+    _playbackEndTimer?.cancel();
+    _playbackEndTimer = null;
     _player.dispose();
+    _playbackCompleteStream.close();
     super.dispose();
   }
 }

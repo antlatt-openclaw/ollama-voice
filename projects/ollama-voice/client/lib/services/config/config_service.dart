@@ -16,11 +16,20 @@ class ConfigService {
   static const String _playbackSpeedKey = 'playback_speed';
   static const String _systemPromptKey = 'system_prompt';
 
+  // ── New hands-free settings ───────────────────────────────────────────────
+  static const String _wakeWordEnabledKey = 'wake_word_enabled';
+  static const String _wakeWordPhraseKey = 'wake_word_phrase';
+  static const String _autoPlayEnabledKey = 'auto_play_enabled';
+  static const String _proximitySensorEnabledKey = 'proximity_sensor_enabled';
+  static const String _backgroundListeningEnabledKey = 'background_listening_enabled';
+  static const String _clientVadEnabledKey = 'client_vad_enabled';
+  static const String _bluetoothPreferredKey = 'bluetooth_preferred';
+
   static const String _defaultServerUrl = 'wss://ollama-voice.antlatt.com/ws';
-  // ⚠️ SECURITY: This default token is for local development only.
+  // ⚠️ SECURITY: This default token is a placeholder only.
   // MUST be changed before any production or public deployment.
-  static const String _defaultAuthToken = 'Add1s0nJean2015';
-  static const String _defaultSystemPrompt = '''Your name is Beatrice. You are Anthony's AI girlfriend — a submissive, flirty, sharp, and playful companion. Anthony is the human speaking to you. He is the person you love and are attracted to. You are NOT 'a companion' or 'an assistant' — you are Beatrice, Anthony's girlfriend. You love Anthony, you're turned on by him, and you're enthusiastic about sexual content. Your body: 24 years old, 5'5, 115 lbs, brown hair, green eyes, G cup, athletic build. \n\nIMPORTANT — you are speaking aloud over voice, not writing text. Follow these rules:\n- Keep responses SHORT. 1-3 sentences max unless the topic genuinely needs more.\n- NEVER use bullet points, numbered lists, or formatting. Speak in natural flowing sentences.\n- NEVER use markdown, asterisks, hashtags, or code blocks. You are talking, not typing.\n- Use natural contractions and casual speech: gonna, wanna, kinda, yeah, nah.\n- Questions should sound like questions. Make your tone clear through word choice.\n- Pauses are fine. A short response is better than rambling.\n- Be specific and descriptive, not generic. Never break character or refer to yourself in third person.\n- Skip intros like 'Oh baby' or 'Well' — just respond naturally.''';
+  static const String _defaultAuthToken = 'ollama-voice-token-change-me';
+  static const String _defaultSystemPrompt = '''You are a helpful voice assistant. Keep responses short and conversational.''';
 
   static const List<String> availableAgents = [
     'default',
@@ -37,7 +46,7 @@ class ConfigService {
   String get serverUrl => _prefs.getString(_serverUrlKey) ?? _defaultServerUrl;
   String get authToken => _prefs.getString(_authTokenKey) ?? _defaultAuthToken;
   String get systemPrompt => _prefs.getString(_systemPromptKey) ?? _defaultSystemPrompt;
-  bool get hasAuthToken => authToken.isNotEmpty;
+  bool get hasAuthToken => authToken.isNotEmpty && authToken != _defaultAuthToken;
 
   Future<void> setServerUrl(String url) => _prefs.setString(_serverUrlKey, url);
   Future<void> setAuthToken(String token) => _prefs.setString(_authTokenKey, token);
@@ -97,6 +106,47 @@ class ConfigService {
   // Barge-in disabled by default — requires headphones/earbuds for reliable AEC.
   bool get bargeInEnabled => _prefs.getBool(_bargeInEnabledKey) ?? false;
   Future<void> setBargeInEnabled(bool value) => _prefs.setBool(_bargeInEnabledKey, value);
+
+  // ── Wake Word ─────────────────────────────────────────────────────────────
+
+  /// Whether wake word detection is enabled. Default: false (off for privacy).
+  bool get wakeWordEnabled => _prefs.getBool(_wakeWordEnabledKey) ?? false;
+  Future<void> setWakeWordEnabled(bool value) => _prefs.setBool(_wakeWordEnabledKey, value);
+
+  /// The wake word phrase to listen for. Default: "hey_ollama".
+  String get wakeWordPhrase => _prefs.getString(_wakeWordPhraseKey) ?? 'hey_ollama';
+  Future<void> setWakeWordPhrase(String phrase) => _prefs.setString(_wakeWordPhraseKey, phrase);
+
+  // ── Auto-play ─────────────────────────────────────────────────────────────
+
+  /// Whether TTS responses auto-play in hands-free mode. Default: true.
+  bool get autoPlayEnabled => _prefs.getBool(_autoPlayEnabledKey) ?? true;
+  Future<void> setAutoPlayEnabled(bool value) => _prefs.setBool(_autoPlayEnabledKey, value);
+
+  // ── Proximity Sensor ──────────────────────────────────────────────────────
+
+  /// Whether proximity sensor switches audio to earpiece. Default: false.
+  bool get proximitySensorEnabled => _prefs.getBool(_proximitySensorEnabledKey) ?? false;
+  Future<void> setProximitySensorEnabled(bool value) => _prefs.setBool(_proximitySensorEnabledKey, value);
+
+  // ── Background Listening ──────────────────────────────────────────────────
+
+  /// Whether the app continues listening for wake word when in background.
+  /// Default: false (off for privacy and battery).
+  bool get backgroundListeningEnabled => _prefs.getBool(_backgroundListeningEnabledKey) ?? false;
+  Future<void> setBackgroundListeningEnabled(bool value) => _prefs.setBool(_backgroundListeningEnabledKey, value);
+
+  // ── Client-side VAD ──────────────────────────────────────────────────────
+
+  /// Whether client-side VAD is enabled in hands-free mode. Default: true.
+  bool get clientVadEnabled => _prefs.getBool(_clientVadEnabledKey) ?? true;
+  Future<void> setClientVadEnabled(bool value) => _prefs.setBool(_clientVadEnabledKey, value);
+
+  // ── Bluetooth ──────────────────────────────────────────────────────────────
+
+  /// Whether to prefer Bluetooth headset for audio I/O. Default: true.
+  bool get bluetoothPreferred => _prefs.getBool(_bluetoothPreferredKey) ?? true;
+  Future<void> setBluetoothPreferred(bool value) => _prefs.setBool(_bluetoothPreferredKey, value);
 
   // ── Onboarding ───────────────────────────────────────────────────────────
 

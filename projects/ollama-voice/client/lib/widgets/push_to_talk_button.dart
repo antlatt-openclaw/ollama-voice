@@ -1,8 +1,8 @@
 import 'dart:async';
-import 'dart:math' as math;
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import '../theme/colors.dart';
+import '../providers/app_state.dart' show HandsFreePhase;
 
 class PushToTalkButton extends StatefulWidget {
   final bool isRecording;
@@ -19,6 +19,10 @@ class PushToTalkButton extends StatefulWidget {
   final Stream<double>? amplitudeStream;
   final DateTime? recordingStartedAt;
 
+  // ── Hands-free visual feedback ─────────────────────────────────────────
+  final HandsFreePhase handsFreePhase;
+  final bool wakeWordEnabled;
+
   const PushToTalkButton({
     super.key,
     required this.isRecording,
@@ -34,17 +38,24 @@ class PushToTalkButton extends StatefulWidget {
     this.isProcessing = false,
     this.amplitudeStream,
     this.recordingStartedAt,
+    this.handsFreePhase = HandsFreePhase.idle,
+    this.wakeWordEnabled = false,
   });
 
   @override
   State<PushToTalkButton> createState() => _PushToTalkButtonState();
 }
 
-class _PushToTalkButtonState extends State<PushToTalkButton> {
+class _PushToTalkButtonState extends State<PushToTalkButton>
+    with SingleTickerProviderStateMixin {
   StreamSubscription<double>? _amplitudeSub;
   double _amplitude = 0.0;
   Timer? _timerTick;
   Duration _elapsed = Duration.zero;
+
+  // Pulse animation for wake word listening
+  late AnimationController _pulseController;
+  late Animation<double> _pulseAnimation;
 
   // Five bar multipliers — centre bar tallest.
   static const _barMult = [0.45, 0.70, 1.0, 0.70, 0.45];
@@ -52,6 +63,13 @@ class _PushToTalkButtonState extends State<PushToTalkButton> {
   @override
   void initState() {
     super.initState();
+    _pulseController = AnimationController(
+      vsync: this,
+      duration: const Duration(milliseconds: 1500),
+    )..repeat(reverse: true);
+    _pulseAnimation = Tween<double>(begin: 0.85, end: 1.15).animate(
+      CurvedAnimation(parent: _pulseController, curve: Curves.easeInOut),
+    );
     _subscribeAmplitude();
     _updateTimer();
   }
@@ -94,6 +112,7 @@ class _PushToTalkButtonState extends State<PushToTalkButton> {
   void dispose() {
     _amplitudeSub?.cancel();
     _timerTick?.cancel();
+    _pulseController.dispose();
     super.dispose();
   }
 
@@ -144,84 +163,207 @@ class _PushToTalkButtonState extends State<PushToTalkButton> {
     );
   }
 
+  // ── Hands-free indicator with full phase support ──────────────────────────
+
   Widget _buildHandsFreeIndicator() {
-    final listening = widget.isHandsFreeListening;
-    final processing = widget.isProcessing && !listening;
+    final phase = widget.handsFreePhase;
 
-    final Color color;
-    final double size;
-    final double glowRadius;
-    if (processing) {
-      color = AppColors.warning;
-      size = 72.0;
-      glowRadius = 14.0;
-    } else if (listening) {
-      color = Colors.green;
-      size = 88.0;
-      glowRadius = 28.0;
-    } else {
-      color = AppColors.primary.withValues(alpha: 0.5);
-      size = 72.0;
-      glowRadius = 14.0;
+    switch (phase) {
+      case HandsFreePhase.wakeWordListening:
+        return _buildWakeWordListening();
+      case HandsFreePhase.recording:
+        return _buildRecordingPhase();
+      case HandsFreePhase.processing:
+        return _buildProcessingPhase();
+      case HandsFreePhase.speaking:
+        return _buildSpeakingPhase();
+      case HandsFreePhase.idle:
+        return _buildIdlePhase();
     }
+  }
 
-    final String label;
-    final Color labelColor;
-    if (processing) {
-      label = 'Processing…';
-      labelColor = AppColors.warning;
-    } else if (listening) {
-      label = 'Listening…';
-      labelColor = Colors.green;
-    } else {
-      label = 'Hands-free';
-      labelColor = AppColors.textSecondary;
-    }
+  Widget _buildWakeWordListening() {
+    return Column(
+      mainAxisSize: MainAxisSize.min,
+      children: [
+        AnimatedBuilder(
+          animation: _pulseAnimation,
+          builder: (context, child) {
+            final scale = _pulseAnimation.value;
+            final size = 80.0 * scale;
+            final glow = 20.0 * scale;
+            return Container(
+              width: size,
+              height: size,
+              decoration: BoxDecoration(
+                shape: BoxShape.circle,
+                color: AppColors.primary,
+                boxShadow: [
+                  BoxShadow(
+                    color: AppColors.primary.withValues(alpha: 0.4 * scale),
+                    blurRadius: glow,
+                    spreadRadius: 3 * scale,
+                  ),
+                ],
+              ),
+              child: child,
+            );
+          },
+          child: Icon(Icons.hearing_rounded,
+              color: Colors.white.withValues(alpha: 0.9), size: 32),
+        ),
+        const SizedBox(height: 6),
+        Text(
+          widget.wakeWordEnabled ? 'Say "Hey Ollama"…' : 'Waiting…',
+          style: TextStyle(
+            color: AppColors.primary,
+            fontSize: 11,
+            fontWeight: FontWeight.w600,
+          ),
+        ),
+      ],
+    );
+  }
 
-    Widget child;
-    if (processing) {
-      child = const Padding(
-        padding: EdgeInsets.all(20),
-        child: CircularProgressIndicator(strokeWidth: 2.5, color: Colors.white),
-      );
-    } else if (listening) {
-      child = _buildWaveform();
-    } else {
-      child = Icon(Icons.hearing_rounded,
-          color: Colors.white.withValues(alpha: 0.7), size: 30);
-    }
-
+  Widget _buildRecordingPhase() {
+    const color = Colors.green;
     return Column(
       mainAxisSize: MainAxisSize.min,
       children: [
         AnimatedContainer(
           duration: const Duration(milliseconds: 300),
-          width: size,
-          height: size,
+          width: 88,
+          height: 88,
           decoration: BoxDecoration(
             shape: BoxShape.circle,
             color: color,
             boxShadow: [
               BoxShadow(
-                color: color.withValues(alpha: listening ? 0.5 : 0.2),
-                blurRadius: glowRadius,
-                spreadRadius: listening ? 4 : 1,
+                color: color.withValues(alpha: 0.5),
+                blurRadius: 28,
+                spreadRadius: 4,
               ),
             ],
           ),
-          child: child,
+          child: _buildWaveform(),
         ),
         const SizedBox(height: 6),
-        AnimatedSwitcher(
-          duration: const Duration(milliseconds: 200),
-          child: Text(
-            label,
-            key: ValueKey(label),
-            style: TextStyle(
-              color: labelColor,
-              fontSize: 11,
-              fontWeight: (listening || processing) ? FontWeight.w600 : FontWeight.normal,
-            ),
+        const Text(
+          'Listening…',
+          style: TextStyle(
+            color: Colors.green,
+            fontSize: 11,
+            fontWeight: FontWeight.w600,
+          ),
+        ),
+      ],
+    );
+  }
+
+  Widget _buildProcessingPhase() {
+    return Column(
+      mainAxisSize: MainAxisSize.min,
+      children: [
+        Container(
+          width: 72,
+          height: 72,
+          decoration: BoxDecoration(
+            shape: BoxShape.circle,
+            color: AppColors.warning.withValues(alpha: 0.12),
+            border: Border.all(
+                color: AppColors.warning.withValues(alpha: 0.4), width: 2),
+          ),
+          child: const Padding(
+            padding: EdgeInsets.all(20),
+            child: CircularProgressIndicator(
+                strokeWidth: 2.5, color: AppColors.warning),
+          ),
+        ),
+        const SizedBox(height: 6),
+        const Text(
+          'Processing…',
+          style: TextStyle(
+            color: AppColors.warning,
+            fontSize: 11,
+            fontWeight: FontWeight.w500,
+          ),
+        ),
+      ],
+    );
+  }
+
+  Widget _buildSpeakingPhase() {
+    const color = AppColors.secondary;
+    return Column(
+      mainAxisSize: MainAxisSize.min,
+      children: [
+        AnimatedBuilder(
+          animation: _pulseAnimation,
+          builder: (context, child) {
+            final scale = _pulseAnimation.value;
+            final size = 80.0 * scale;
+            final glow = 20.0 * scale;
+            return Container(
+              width: size,
+              height: size,
+              decoration: BoxDecoration(
+                shape: BoxShape.circle,
+                color: color,
+                boxShadow: [
+                  BoxShadow(
+                    color: color.withValues(alpha: 0.4 * scale),
+                    blurRadius: glow,
+                    spreadRadius: 3,
+                  ),
+                ],
+              ),
+              child: child,
+            );
+          },
+          child: Icon(Icons.volume_up_rounded,
+              color: Colors.white.withValues(alpha: 0.9), size: 32),
+        ),
+        const SizedBox(height: 6),
+        const Text(
+          'Speaking…',
+          style: TextStyle(
+            color: AppColors.secondary,
+            fontSize: 11,
+            fontWeight: FontWeight.w600,
+          ),
+        ),
+      ],
+    );
+  }
+
+  Widget _buildIdlePhase() {
+    const color = AppColors.primary;
+    return Column(
+      mainAxisSize: MainAxisSize.min,
+      children: [
+        Container(
+          width: 72,
+          height: 72,
+          decoration: BoxDecoration(
+            shape: BoxShape.circle,
+            color: color.withValues(alpha: 0.5),
+            boxShadow: [
+              BoxShadow(
+                color: color.withValues(alpha: 0.2),
+                blurRadius: 14,
+                spreadRadius: 1,
+              ),
+            ],
+          ),
+          child: Icon(Icons.hearing_rounded,
+              color: Colors.white.withValues(alpha: 0.7), size: 30),
+        ),
+        const SizedBox(height: 6),
+        Text(
+          widget.wakeWordEnabled ? 'Wake word on' : 'Hands-free',
+          style: const TextStyle(
+            color: AppColors.textSecondary,
+            fontSize: 11,
           ),
         ),
       ],

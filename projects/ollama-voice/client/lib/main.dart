@@ -10,6 +10,9 @@ import 'providers/connection_state.dart' show VoiceConnectionState;
 import 'providers/conversation_state.dart';
 import 'services/audio/recorder_service.dart';
 import 'services/audio/player_service.dart';
+import 'services/audio/audio_mode_service.dart';
+import 'services/audio/wake_word_service.dart';
+import 'services/audio/bluetooth_service.dart';
 
 void main() async {
   WidgetsFlutterBinding.ensureInitialized();
@@ -22,6 +25,11 @@ void main() async {
 
   await NotificationService.init();
 
+  final audioModeService = AudioModeService();
+
+  final bluetoothService = BluetoothService();
+  await bluetoothService.init();
+
   runApp(
     MultiProvider(
       providers: [
@@ -30,6 +38,7 @@ void main() async {
           create: (_) => conversationStorage,
           dispose: (_, s) => s.close(),
         ),
+        Provider<AudioModeService>.value(value: audioModeService),
         ChangeNotifierProvider<AppState>(
           create: (_) => AppState(configService),
         ),
@@ -41,9 +50,12 @@ void main() async {
         ),
         Provider<RecorderService>(
           create: (_) => RecorderService(),
-          dispose: (_, s) => s.dispose(),
         ),
         ChangeNotifierProvider<PlayerService>(create: (_) => PlayerService()),
+        ChangeNotifierProvider<WakeWordService>(
+          create: (_) => WakeWordService(),
+        ),
+        Provider<BluetoothService>.value(value: bluetoothService),
       ],
       child: const OpenClawVoiceApp(),
     ),

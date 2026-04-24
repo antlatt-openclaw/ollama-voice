@@ -47,7 +47,7 @@ class VoiceConnectionState extends ChangeNotifier {
 
   void _initConnectivityListener() {
     _connectivitySub = Connectivity().onConnectivityChanged.listen((result) {
-      // connectivity_plus 5.x emits a single ConnectivityResult.
+      // connectivity_plus 5.x emits ConnectivityResult (single value).
       final hasConnection = result != ConnectivityResult.none;
       _hasNetwork = hasConnection;
       notifyListeners();

@@ -1,0 +1,72 @@
+name: ollama_voice
+description: Ollama direct voice client
+version: 1.0.0+4
+
+environment:
+  sdk: '>=3.6.0 <4.0.0'
+
+dependencies:
+  flutter:
+    sdk: flutter
+
+  # WebSocket
+  web_socket_channel: ^2.4.0
+
+  # Audio
+  flutter_sound: ^9.2.13
+  just_audio: ^0.9.36
+  audio_session: ^0.1.18
+
+  # State management
+  provider: ^6.1.1
+
+  # Storage
+  shared_preferences: ^2.2.2
+  sqflite: ^2.3.0
+  path: ^1.8.3
+  path_provider: ^2.1.2
+  uuid: ^4.3.3
+
+  # Network detection
+  connectivity_plus: ^5.0.2
+
+  # Permissions
+  permission_handler: ^11.1.0
+
+  # UI
+  cupertino_icons: ^1.0.6
+
+  # Sharing / export
+  share_plus: ^10.0.0
+
+  # Markdown rendering
+  flutter_markdown: ^0.7.0
+
+  # Wake lock (always-on-screen)
+  wakelock_plus: ^1.0.0
+
+  # Local notifications (background response alerts + background listening indicator)
+  flutter_local_notifications: ^17.0.0
+
+  # Wake word detection (optional — fallback energy-based detection is built-in)
+  porcupine_flutter: ^3.0.3
+
+  # Bluetooth SCO and audio routing (Android native via MethodChannel)
+  # flutter_blue_plus is used for detecting connected BT headsets
+  flutter_blue_plus: ^1.32.0
+
+  # NOTE: flutter_foreground_task was removed. Background listening on Android
+  # 12+ may be limited without a proper foreground service. For now, background
+  # listening works on Android <12 via flutter_local_notifications.
+
+dev_dependencies:
+  flutter_test:
+    sdk: flutter
+  flutter_lints: ^3.0.1
+
+  # Integration test support
+  integration_test:
+    sdk: flutter
+
+flutter:
+  uses-material-design: true

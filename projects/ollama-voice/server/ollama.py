@@ -59,6 +59,9 @@ async def stream_ollama_tokens(
                     if payload == "[DONE]":
                         break
                     try:
+                        if len(payload) > 1048576:
+                            log.warning("Oversized SSE payload (%d bytes), skipping", len(payload))
+                            continue
                         chunk = json.loads(payload)
                         # Surface Ollama errors in the SSE stream
                         if "error" in chunk:
@@ -87,6 +90,10 @@ async def check_ollama(cfg: OllamaConfig) -> dict:
     """Check if Ollama is reachable and the model is available."""
     try:
         parsed = urlparse(cfg.url)
+        # Note: assumes cfg.url points to a dedicated Ollama endpoint.  Path-based
+        # proxies that embed the model path (e.g. /ollama/v1/chat/completions) will
+        # break /api/tags and /v1/models probes.  Set cfg.url to the proxy root or
+        # run Ollama on a dedicated sub-domain if you need these checks.
         base_url = f"{parsed.scheme}://{parsed.netloc}"
         async with httpx.AsyncClient(timeout=5.0) as client:
             # Try native Ollama /api/tags endpoint first

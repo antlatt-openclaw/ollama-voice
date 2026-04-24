@@ -53,6 +53,9 @@ HF_MAX_HISTORY = 16
 # Maximum concurrent TTS synthesis requests to avoid overwhelming the TTS server.
 MAX_CONCURRENT_TTS = 3
 
+# Maximum size (bytes) for a single JSON text message from the client.
+MAX_JSON_MSG_SIZE = 65536
+
 # Default system prompt — voice-optimized for TTS output.
 # Clients can read/modify this via get_config/set_config messages,
 # which persist across server restarts.
@@ -240,16 +243,10 @@ async def generate_response(ws: WebSocket, text: str, history: list[dict] | None
 
     await _locked_send_json(ResponseStartMessage(text=""))
 
-    # Stream LLM tokens, extract sentences, and fire TTS tasks in parallel
+    # Collect full LLM response text, then synthesize as a single TTS call
+    # This ensures natural prosody across the entire response instead of
+    # per-sentence TTS which sounds disjointed when concatenated.
     full_response = ""
-    text_buffer = ""
-    tts_tasks = []
-    tts_semaphore = asyncio.Semaphore(MAX_CONCURRENT_TTS)
-
-    async def _synthesize_with_limit(text: str) -> bytes | None:
-        """Synthesize with concurrency limit to avoid overwhelming TTS server."""
-        async with tts_semaphore:
-            return await synthesize(text, cfg.tts)
 
     try:
         async for delta, accumulated in stream_ollama_tokens(
@@ -260,26 +257,11 @@ async def generate_response(ws: WebSocket, text: str, history: list[dict] | None
 
             full_response = accumulated
             await _locked_send_json(ResponseDeltaMessage(text=delta))
-
-            text_buffer += delta
-            sentences, text_buffer = extract_sentences(text_buffer)
-
-            for sentence in sentences:
-                if current_state == ServerState.INTERRUPTED:
-                    break
-                log.info("Queueing TTS for sentence (%d chars): %.80s", len(sentence), sentence)
-                task = asyncio.create_task(_synthesize_with_limit(sentence))
-                tts_tasks.append(task)
     except Exception as e:
         log.error("LLM streaming error: %s", e)
 
     if current_state == ServerState.INTERRUPTED or shutdown_event.is_set():
-        log.debug("Interrupted/shutdown during LLM, cancelling %d TTS tasks", len(tts_tasks))
-        for task in tts_tasks:
-            if not task.done():
-                task.cancel()
-        if tts_tasks:
-            await asyncio.gather(*tts_tasks, return_exceptions=True)
+        log.debug("Interrupted/shutdown during LLM")
         current_state = ServerState.IDLE
         return None
 
@@ -288,19 +270,19 @@ async def generate_response(ws: WebSocket, text: str, history: list[dict] | None
         current_state = ServerState.IDLE
         return None
 
-    # Synthesize any remaining text that didn't end with a sentence terminator
-    if text_buffer.strip():
-        log.info("Queueing TTS for final text (%d chars): %.80s", len(text_buffer), text_buffer)
-        task = asyncio.create_task(synthesize(text_buffer.strip(), cfg.tts))
-        tts_tasks.append(task)
+    # Single TTS call for the entire response
+    log.info("Synthesizing full response (%d chars)", len(full_response.strip()))
+    tts_tasks = []
+    task = asyncio.create_task(synthesize(full_response.strip(), cfg.tts))
+    tts_tasks.append(task)
 
-    # Stream audio continuously: await TTS tasks in order and send audio as it arrives
-    log.info("Streaming %d audio segments", len(tts_tasks))
+    # Collect all TTS audio first, then send as one concatenated file
+    log.info("Collecting %d audio segments", len(tts_tasks))
+    all_audio = bytearray()
     audio_started = False
 
     for task in tts_tasks:
         if current_state == ServerState.INTERRUPTED or shutdown_event.is_set():
-            # Cancel remaining tasks to avoid wasting TTS server resources
             for remaining in tts_tasks[tts_tasks.index(task):]:
                 if not remaining.done():
                     remaining.cancel()
@@ -317,19 +299,16 @@ async def generate_response(ws: WebSocket, text: str, history: list[dict] | None
             continue
 
         if audio and current_state != ServerState.INTERRUPTED:
-            if not audio_started:
-                # For continuous streaming, total duration is unknown until all
-                # audio is generated. Clients should handle duration_ms=0 as
-                # "streaming, duration unknown".
-                await _locked_send_json(AudioStartMessage(duration_ms=0))
-                audio_started = True
+            all_audio.extend(audio)
 
-            success = await _locked_send_audio(audio)
-            if not success:
-                break
-
-    if audio_started:
-        await _locked_send_json(AudioEndMessage())
+    # Send all audio as a single blob
+    if all_audio and current_state != ServerState.INTERRUPTED:
+        # Calculate total duration: output_sample_rate Hz 16-bit mono = rate*2 bytes/sec
+        duration_ms = int(len(all_audio) / (cfg.tts.output_sample_rate * 2) * 1000)
+        await _locked_send_json(AudioStartMessage(duration_ms=duration_ms))
+        success = await _locked_send_audio(bytes(all_audio))
+        if success:
+            await _locked_send_json(AudioEndMessage())
 
     if current_state == ServerState.INTERRUPTED:
         log.debug("Interrupted during TTS, skipping ResponseEnd")
@@ -583,7 +562,7 @@ async def hands_free_processor(
 
 @app.websocket("/ws")
 async def websocket_endpoint(ws: WebSocket):
-    global active_connection, active_connection_id, current_state
+    global active_connection, active_connection_id, current_state, _persisted_prompt
     active_mode = "ptt"
 
     await ws.accept(subprotocol="openclaw-voice")
@@ -603,6 +582,7 @@ async def websocket_endpoint(ws: WebSocket):
             auth = AuthMessage(**data)
             if auth.token != cfg.server.auth_token:
                 await send_json(ws, AuthFailedMessage(reason="Invalid token"))
+                await asyncio.sleep(0.05)
                 await ws.close(code=4003, reason="Invalid token")
                 return
         except Exception as e:
@@ -649,7 +629,7 @@ async def websocket_endpoint(ws: WebSocket):
             _active_tasks.discard(t)
             exc = t.exception()
             if exc is not None:
-                log.error("Task failed: %s", exc, exc_info=exc)
+                log.error("Task failed: %s", exc, exc_info=True)
         task.add_done_callback(_on_done)
         return task
 
@@ -670,6 +650,9 @@ async def websocket_endpoint(ws: WebSocket):
             log.debug("Received message type: %s", msg.get('type'))
 
             if msg.get("type") == "websocket.receive" and "text" in msg:
+                if len(msg["text"]) > MAX_JSON_MSG_SIZE:
+                    log.warning("Oversized JSON message from %s (%d bytes), dropping", conn_id, len(msg["text"]))
+                    continue
                 try:
                     data = json.loads(msg["text"])
                     if data.get("type") == "interrupt":
