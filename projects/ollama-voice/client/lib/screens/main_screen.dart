@@ -493,7 +493,7 @@ class _MainScreenState extends State<MainScreen> with WidgetsBindingObserver {
     final appState = context.read<app.AppState>();
     if (!conn.isConnected) return;
     _handsFreeStreaming = true;
-
+    try {
     // Enable auto-play for hands-free mode
     if (appState.autoPlayEnabled) {
       player.setAutoPlay(true);
