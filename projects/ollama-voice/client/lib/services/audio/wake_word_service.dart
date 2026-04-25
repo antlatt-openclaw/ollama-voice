@@ -115,46 +115,56 @@ class WakeWordService extends ChangeNotifier {
 
   // ── Public API ────────────────────────────────────────────────────────────
 
+  bool _isStarting = false;
+
   /// Start continuous wake word listening.
   Future<void> start() async {
-    if (_isActive) return;
+    if (_isActive || _isStarting) return;
+    _isStarting = true;
 
-    final hasPermission = await Permission.microphone.request();
-    if (!hasPermission.isGranted) {
-      throw Exception('Microphone permission required for wake word detection');
-    }
-
-    _recorder = FlutterSoundRecorder();
-    await _recorder!.openRecorder();
-    await _recorder!.setSubscriptionDuration(const Duration(milliseconds: 80));
-
-    _progressSub = _recorder!.onProgress?.listen((e) {
-      final db = e.decibels ?? -160.0;
-      final normalized = ((db + 80.0) / 70.0).clamp(0.0, 1.0);
-      if (!_amplitudeStream.isClosed) {
-        _amplitudeStream.add(normalized);
+    try {
+      final hasPermission = await Permission.microphone.request();
+      if (!hasPermission.isGranted) {
+        throw Exception('Microphone permission required for wake word detection');
       }
-    });
 
-    await _recorder!.startRecorder(
-      toStream: _audioStream.sink,
-      codec: Codec.pcm16,
-      numChannels: _numChannels,
-      sampleRate: _sampleRate,
-      bufferSize: 1024,
-      audioSource: AudioSource.voice_communication,
-    );
+      _recorder = FlutterSoundRecorder();
+      await _recorder!.openRecorder();
+      await _recorder!.setSubscriptionDuration(const Duration(milliseconds: 80));
 
-    _isActive = true;
-    _isListening = true;
-    _ringBufferPos = 0;
-    _ringBufferLen = 0;
-    _energyGateOpen = false;
-    _consecutiveFramesAbove = 0;
-    _patternMatchCount = 0;
+      _progressSub = _recorder!.onProgress?.listen((e) {
+        final db = e.decibels ?? -160.0;
+        final normalized = ((db + 80.0) / 70.0).clamp(0.0, 1.0);
+        if (!_amplitudeStream.isClosed) {
+          _amplitudeStream.add(normalized);
+        }
+      });
 
-    _audioSub = _audioStream.stream.listen(_onAudioChunk);
-    notifyListeners();
+      await _recorder!.startRecorder(
+        toStream: _audioStream.sink,
+        codec: Codec.pcm16,
+        numChannels: _numChannels,
+        sampleRate: _sampleRate,
+        bufferSize: 1024,
+        audioSource: AudioSource.voice_communication,
+      );
+
+      _isActive = true;
+      _isListening = true;
+      _ringBufferPos = 0;
+      _ringBufferLen = 0;
+      _energyGateOpen = false;
+      _consecutiveFramesAbove = 0;
+      _patternMatchCount = 0;
+
+      _audioSub = _audioStream.stream.listen(_onAudioChunk);
+      notifyListeners();
+    } catch (e) {
+      print('[WakeWordService] start error: $e');
+      rethrow;
+    } finally {
+      _isStarting = false;
+    }
   }
 
   /// Stop wake word listening.
@@ -162,6 +172,7 @@ class WakeWordService extends ChangeNotifier {
     if (!_isActive) return;
     _isActive = false;
     _isListening = false;
+    _isStarting = false;
 
     await _audioSub?.cancel();
     _audioSub = null;
@@ -188,6 +199,7 @@ class WakeWordService extends ChangeNotifier {
 
   @override
   void dispose() {
+    _isStarting = false;
     stop().catchError((_) {});
     _audioStream.close().catchError((_) {});
     _amplitudeStream.close().catchError((_) {});

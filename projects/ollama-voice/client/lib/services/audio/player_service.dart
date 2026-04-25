@@ -13,6 +13,7 @@ class PlayerService extends ChangeNotifier {
 
   ConcatenatingAudioSource? _playlist;
   bool _playlistActive = false;
+  bool _suppressPlaybackEndTimer = false;
 
   final List<Uint8List> _pcmChunks = [];
   int _audioBufferLength = 0;
@@ -69,7 +70,7 @@ class PlayerService extends ChangeNotifier {
         }
       }
       // When playback stops (naturally or by user), schedule mic re-enable.
-      if (!state.playing && _playbackEndTimer == null && !_isInterrupted) {
+      if (!state.playing && _playbackEndTimer == null && !_isInterrupted && !_suppressPlaybackEndTimer) {
         _playbackEndTimer = Timer(
           const Duration(milliseconds: _micReenableDelayMs),
           () {
@@ -77,6 +78,10 @@ class PlayerService extends ChangeNotifier {
             onPlaybackEnded?.call();
           },
         );
+      }
+      // Playback actually started — clear suppression flag.
+      if (state.playing) {
+        _suppressPlaybackEndTimer = false;
       }
       notifyListeners();
     });
@@ -145,6 +150,7 @@ class PlayerService extends ChangeNotifier {
     _playbackEndTimer?.cancel();
     _playbackEndTimer = null;
     _isInterrupted = false;
+    _suppressPlaybackEndTimer = true;
     await _player.stop();
     _playlist = ConcatenatingAudioSource(children: []);
     _playlistActive = false;

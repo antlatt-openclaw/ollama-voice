@@ -19,6 +19,7 @@ class WebSocketService {
 
   Timer? _keepaliveTimer;
   static const Duration _keepaliveInterval = Duration(seconds: 25);
+  DateTime? _lastPongTime;
   bool _authenticated = false;
 
   String? get connectionId => _connectionId;
@@ -155,9 +156,17 @@ class WebSocketService {
 
   void _startKeepalive() {
     _keepaliveTimer?.cancel();
+    _lastPongTime = DateTime.now();
     _keepaliveTimer = Timer.periodic(_keepaliveInterval, (_) {
       if (_channel != null) {
         _channel!.sink.add(jsonEncode({'type': 'ping'}));
+      }
+      // Check for pong timeout — if no pong received in 2× keepalive interval,
+      // force a reconnect by emitting disconnected event.
+      if (_lastPongTime != null &&
+          DateTime.now().difference(_lastPongTime!) > const Duration(seconds: 60)) {
+        print('[WebSocket] Pong timeout — forcing reconnect');
+        _events.add(WebSocketEvent(type: EventType.disconnected));
       }
     });
   }
@@ -165,7 +174,10 @@ class WebSocketService {
   void _handleMessage(dynamic data) {
     if (data is String) {
       final event = WebSocketEvent.fromJson(jsonDecode(data));
-      if (event.type == EventType.pong) return;
+      if (event.type == EventType.pong) {
+        _lastPongTime = DateTime.now();
+        return;
+      }
       _events.add(event);
     } else if (data is List<int>) {
       _audioOut.add(data is Uint8List ? data : Uint8List.fromList(data));

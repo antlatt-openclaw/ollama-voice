@@ -39,7 +39,7 @@ class NotificationService {
     if (!_initialized) return;
     const details = NotificationDetails(
       android: AndroidNotificationDetails(
-        'voice_responses',
+        _responseChannelId,
         'Voice Responses',
         channelDescription: 'Notifications when a voice response completes',
         importance: Importance.defaultImportance,
@@ -64,7 +64,7 @@ class NotificationService {
     if (!_initialized) return;
     const details = NotificationDetails(
       android: AndroidNotificationDetails(
-        'background_listening',
+        _backgroundListeningChannelId,
         'Background Listening',
         channelDescription: 'Shows when the app is listening for the wake word in the background',
         importance: Importance.low, // Low priority — non-intrusive
