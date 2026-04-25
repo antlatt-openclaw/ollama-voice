@@ -215,6 +215,7 @@ class AudioCoordinator extends ChangeNotifier {
     _audioSub = null;
     await _stopRecorderOnly();
     _resetWakeWord();
+    _mode = AudioMode.idle;
   }
 
   /// Acknowledge a wake-word detection (resets the flag).
@@ -256,8 +257,7 @@ class AudioCoordinator extends ChangeNotifier {
 
   @override
   void dispose() {
-    stopAll().catchError((_) {});
-    _cleanupAsync().catchError((_) {});
+    stopAll().then((_) => _cleanupAsync()).catchError((_) {});
     super.dispose();
   }
 

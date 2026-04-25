@@ -281,9 +281,16 @@ class _MainScreenState extends State<MainScreen> with WidgetsBindingObserver {
             await _saveResponse();
           }
 
-          // After response ends in hands-free, go back to idle/wake word listening
+          // After response ends in hands-free, go back to idle/wake word listening.
+          // If TTS audio was received, PlayerService.onPlaybackEnded will trigger
+          // _scheduleReturnToListening() after playback actually finishes.
+          // If no audio was received (text-only response), schedule immediately.
           if (appState.handsFreeEnabled) {
-            _scheduleReturnToListening();
+            final player = context.read<PlayerService>();
+            if (!_firstAudioReceived || !player.isPlaying) {
+              _scheduleReturnToListening();
+            }
+            // If audio was received and is playing, onPlaybackEnded handles it.
           }
         }
         break;
@@ -320,9 +327,14 @@ class _MainScreenState extends State<MainScreen> with WidgetsBindingObserver {
           _isProcessing = false;
           _currentResponse = '';
           if (appState.handsFreeEnabled) {
-            appState.setHandsFreePhase(app.HandsFreePhase.idle);
+            // Don't set idle — let _scheduleReturnToListening() bring us back
+            // to wake-word listening after the interrupt.
+            appState.setHandsFreePhase(app.HandsFreePhase.processing);
           }
         });
+        if (appState.handsFreeEnabled) {
+          _scheduleReturnToListening();
+        }
         break;
 
       case EventType.error:
@@ -499,6 +511,14 @@ class _MainScreenState extends State<MainScreen> with WidgetsBindingObserver {
       player.setAutoPlay(true);
     }
 
+    // Wire up the mic re-enable callback so the microphone returns to
+    // wake-word listening only AFTER TTS playback actually finishes.
+    player.onPlaybackEnded = () {
+      if (mounted && appState.handsFreeEnabled && appState.wakeWordEnabled) {
+        _scheduleReturnToListening();
+      }
+    };
+
     // Switch Android audio to MODE_IN_COMMUNICATION so the hardware AEC
     // receives the speaker loopback reference and can cancel TTS echo.
     await AudioModeService.setVoiceCommunicationMode();
@@ -551,13 +571,13 @@ class _MainScreenState extends State<MainScreen> with WidgetsBindingObserver {
     }
 
     // Monitor playback completion for hands-free phase transitions.
-    // responseEnd already schedules the return to listening; we only update
-    // the phase here to avoid creating duplicate delayed callbacks.
+    // Phase transitions after playback are handled by _scheduleReturnToListening()
+    // (triggered by responseEnd and/or onPlaybackEnded). Do NOT overwrite phase
+    // here — it would clobber the wakeWordListening state set by
+    // _scheduleReturnToListening().
     _playbackCompleteSub?.cancel();
     _playbackCompleteSub = player.playbackCompleteStream.listen((_) {
-      if (appState.handsFreeEnabled && mounted) {
-        appState.setHandsFreePhase(app.HandsFreePhase.idle);
-      }
+      // Intentionally no-op: phase managed by _scheduleReturnToListening().
     });
 
     // Start proximity sensor if enabled
@@ -592,6 +612,8 @@ class _MainScreenState extends State<MainScreen> with WidgetsBindingObserver {
       print('[MainScreen] _startHandsFreeStreaming error: $e');
       rethrow;
     }
+    // NO finally block — _handsFreeStreaming stays true until
+    // _stopHandsFreeStreaming() is called explicitly.
   }
 
   Future<void> _stopHandsFreeStreaming() async {
@@ -644,7 +666,7 @@ class _MainScreenState extends State<MainScreen> with WidgetsBindingObserver {
     _wakeWordStarting = true;
 
     try {
-      // Remove any previous wake-word listener first
+      // Remove any previous wake-word listener first.
       _removeWakeWordListener();
 
       final coordinator = context.read<AudioCoordinator>();
