@@ -78,6 +78,13 @@ class AudioCoordinator extends ChangeNotifier {
   final StreamController<String> _errorStream = StreamController.broadcast();
   Stream<String> get errorStream => _errorStream.stream;
 
+  // ── Wake-word detection stream ──────────────────────────────────────────────
+  // Emits the detected phrase each time a wake word is recognized.
+  // This is more reliable than ChangeNotifier.addListener which fires on
+  // every notifyListeners() call (e.g. every amplitude update).
+  final StreamController<String> _wakeWordDetectStream = StreamController.broadcast();
+  Stream<String> get wakeWordDetectStream => _wakeWordDetectStream.stream;
+
   // ═════════════════════════════════════════════════════════════════════════
   //  PUBLIC API
   // ═════════════════════════════════════════════════════════════════════════
@@ -260,6 +267,7 @@ class AudioCoordinator extends ChangeNotifier {
     await _amplitudeStream.close();
     await _vadStateStream.close();
     await _errorStream.close();
+    await _wakeWordDetectStream.close();
     if (_recorder != null) {
       await _recorder!.closeRecorder();
       _recorder = null;
@@ -392,6 +400,7 @@ class AudioCoordinator extends ChangeNotifier {
     _wwConsecFramesAbove = 0;
     _wwPatternMatchCount = 0;
     print('[AudioCoordinator] Wake word detected: "$word"');
+    if (!_wakeWordDetectStream.isClosed) _wakeWordDetectStream.add(word);
     notifyListeners();
   }
 

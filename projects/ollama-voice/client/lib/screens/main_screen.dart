@@ -34,7 +34,7 @@ class _MainScreenState extends State<MainScreen> with WidgetsBindingObserver {
   StreamSubscription? _recorderSub;
   StreamSubscription? _bargeInSub;
   StreamSubscription? _vadSub;
-  VoidCallback? _wakeWordListener;
+  StreamSubscription? _wakeWordSub;
   StreamSubscription? _playbackCompleteSub;
   StreamSubscription? _proximitySub;
   StreamSubscription? _bluetoothSub;
@@ -493,7 +493,7 @@ class _MainScreenState extends State<MainScreen> with WidgetsBindingObserver {
     final appState = context.read<app.AppState>();
     if (!conn.isConnected) return;
     _handsFreeStreaming = true;
-    try {
+
     // Enable auto-play for hands-free mode
     if (appState.autoPlayEnabled) {
       player.setAutoPlay(true);
@@ -588,10 +588,9 @@ class _MainScreenState extends State<MainScreen> with WidgetsBindingObserver {
       appState.setHandsFreePhase(app.HandsFreePhase.recording);
     }
     } catch (e) {
+      _handsFreeStreaming = false;
       print('[MainScreen] _startHandsFreeStreaming error: $e');
       rethrow;
-    } finally {
-      _handsFreeStreaming = false;
     }
   }
 
@@ -645,41 +644,52 @@ class _MainScreenState extends State<MainScreen> with WidgetsBindingObserver {
     _wakeWordStarting = true;
 
     try {
+      // Remove any previous wake-word listener first
+      _removeWakeWordListener();
+
+      final coordinator = context.read<AudioCoordinator>();
+
       // Stop any active recording first
-      await context.read<AudioCoordinator>().stopAll();
+      await coordinator.stopAll();
 
-      if (!context.read<AudioCoordinator>().isRecording || context.read<AudioCoordinator>().mode != AudioMode.wakeWord) {
-        context.read<AudioCoordinator>().setWakePhrase(appState.wakeWordPhrase);
-        await context.read<AudioCoordinator>().startWakeWordListening();
+      if (!coordinator.isRecording || coordinator.mode != AudioMode.wakeWord) {
+        coordinator.setWakePhrase(appState.wakeWordPhrase);
+        await coordinator.startWakeWordListening();
       }
-      _wakeWordListener = () async {
-        if (context.read<AudioCoordinator>().wakeWordDetected == true && mounted) {
-          print('[MainScreen] Wake word detected: ${context.read<AudioCoordinator>().lastDetectedWord}');
-          context.read<AudioCoordinator>().acknowledgeWakeWord();
 
-          // Transition to recording phase
-          final appState = context.read<app.AppState>();
-          appState.setHandsFreePhase(app.HandsFreePhase.recording);
-          appState.setHandsFreeListening(true);
+      // Listen for wake-word detections via the dedicated stream.
+      // Using a stream instead of ChangeNotifier.addListener avoids firing
+      // on every amplitude update — only fires on actual detections.
+      _wakeWordSub?.cancel();
+      _wakeWordSub = coordinator.wakeWordDetectStream.listen((detectedPhrase) async {
+        if (!mounted) return;
+        print('[MainScreen] Wake word detected: $detectedPhrase');
 
-          // Now start the main recorder and begin streaming audio to server
-          final conn = context.read<VoiceConnectionState>();
-          _recorderSub?.cancel();
-          _recorderSub = context.read<AudioCoordinator>().audioStream.listen((chunk) {
-            final phase = context.read<app.AppState>().handsFreePhase;
-            final player = context.read<PlayerService>();
-            // Phase guard: only send during recording phase
-            if (phase == app.HandsFreePhase.recording && !player.isPlaying) {
-              conn.sendAudio(chunk);
-            }
-          });
-          await context.read<AudioCoordinator>().startRecording();
+        // Cancel the wake-word stream sub immediately to prevent re-entry
+        _wakeWordSub?.cancel();
+        _wakeWordSub = null;
 
-          // Stop wake word listening while recording
-          await context.read<AudioCoordinator>().stopWakeWordListening();
-        }
-      };
-      context.read<AudioCoordinator>().addListener(_wakeWordListener!);
+        // Transition to recording phase
+        final appState = context.read<app.AppState>();
+        appState.setHandsFreePhase(app.HandsFreePhase.recording);
+        appState.setHandsFreeListening(true);
+
+        // Now start the main recorder and begin streaming audio to server
+        final conn = context.read<VoiceConnectionState>();
+        _recorderSub?.cancel();
+        _recorderSub = coordinator.audioStream.listen((chunk) {
+          final phase = context.read<app.AppState>().handsFreePhase;
+          final player = context.read<PlayerService>();
+          // Phase guard: only send during recording phase
+          if (phase == app.HandsFreePhase.recording && !player.isPlaying) {
+            conn.sendAudio(chunk);
+          }
+        });
+        await coordinator.startRecording();
+
+        // Stop wake word listening while recording
+        await coordinator.stopWakeWordListening();
+      });
     } catch (e) {
       print('[MainScreen] Wake word service error: $e');
     } finally {
@@ -688,10 +698,8 @@ class _MainScreenState extends State<MainScreen> with WidgetsBindingObserver {
   }
 
   void _removeWakeWordListener() {
-    if (_wakeWordListener != null) {
-      context.read<AudioCoordinator>().removeListener(_wakeWordListener!);
-    }
-    _wakeWordListener = null;
+    _wakeWordSub?.cancel();
+    _wakeWordSub = null;
   }
 
   Future<void> _stopWakeWordListeningOnly() async {
