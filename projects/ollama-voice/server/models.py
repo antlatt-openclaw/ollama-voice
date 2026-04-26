@@ -81,15 +81,6 @@ class ListeningEndMessage(BaseModel):
     type: str = "listening_end"
 
 
-class GetConfigMessage(BaseModel):
-    type: str = "get_config"
-
-
-class SetConfigMessage(BaseModel):
-    type: str = "set_config"
-    system_prompt: str | None = None  # None = reset to default
-
-
 class ConfigMessage(BaseModel):
     type: str = "config"
     system_prompt: str  # current effective system prompt

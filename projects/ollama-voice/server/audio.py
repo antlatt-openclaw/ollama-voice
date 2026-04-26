@@ -1,4 +1,4 @@
-"""Audio processing utilities — VAD, turn detection, resampling, format conversion."""
+"""Audio utilities — VAD classifier, per-session audio buffer, end-of-turn detector, format helpers."""
 
 import asyncio
 import logging
@@ -15,120 +15,113 @@ try:
 except ImportError:
     torch = None
 
-from config import Config
-
 log = logging.getLogger("server")
 
+# Silero VAD requires exactly 512 int16 samples at 16 kHz = 1024 bytes.
+VAD_CHUNK_SIZE = 1024
+# Slice size for splitting incoming audio frames before VAD.
+VAD_SPLIT_SIZE = 1024
+# Maximum bytes the per-session audio buffer will hold (~30 s at 16 kHz/16-bit mono).
+AUDIO_BUFFER_MAX_BYTES = 960_000
 
-class VADProcessor:
-    """Silero VAD wrapper for real-time speech detection."""
 
-    def __init__(self, cfg: Config):
-        self.cfg = cfg
-        self.model = None
-        self._audio_buffer = bytearray()
+def pad_to_vad_window(pcm_bytes: bytes) -> bytes:
+    """Pad or truncate a PCM chunk to exactly VAD_CHUNK_SIZE bytes.
 
-    def load(self):
-        if load_silero_vad is None:
-            raise RuntimeError("silero-vad not installed")
-        self.model = load_silero_vad()
+    Padding repeats the last sample to avoid a hard zero-silence edge.
+    """
+    if len(pcm_bytes) == VAD_CHUNK_SIZE:
+        return pcm_bytes
+    if len(pcm_bytes) > VAD_CHUNK_SIZE:
+        return pcm_bytes[:VAD_CHUNK_SIZE]
+    last_sample = pcm_bytes[-2:] if len(pcm_bytes) >= 2 else b'\x00\x00'
+    short = VAD_CHUNK_SIZE - len(pcm_bytes)
+    return pcm_bytes + last_sample * (short // 2) + (b'\x00' * (short % 2))
+
+
+class AudioBuffer:
+    """Per-session PCM ring buffer for PTT mode.
+
+    Keeps at most AUDIO_BUFFER_MAX_BYTES; drops oldest audio on overflow.
+    """
+
+    def __init__(self):
+        self._buf = bytearray()
+
+    def add(self, pcm_bytes: bytes):
+        self._buf.extend(pcm_bytes)
+        if len(self._buf) > AUDIO_BUFFER_MAX_BYTES:
+            excess = len(self._buf) - AUDIO_BUFFER_MAX_BYTES
+            del self._buf[:excess]
+            log.warning("AudioBuffer overflow, dropped %d bytes of oldest audio", excess)
+
+    def take(self) -> bytes:
+        data = bytes(self._buf)
+        self._buf = bytearray()
+        return data
+
+    def __len__(self) -> int:
+        return len(self._buf)
+
+
+class VAD:
+    """Stateless Silero VAD classifier. Lazy-loads on first ensure_loaded() call."""
+
+    def __init__(self, sample_rate: int):
+        self.sample_rate = sample_rate
+        self._model = None
+        self._load_lock = asyncio.Lock()
+
+    @property
+    def loaded(self) -> bool:
+        return self._model is not None
+
+    async def ensure_loaded(self):
+        if self._model is not None:
+            return
+        async with self._load_lock:
+            if self._model is not None:
+                return
+            if load_silero_vad is None:
+                raise RuntimeError("silero-vad not installed")
+            loop = asyncio.get_running_loop()
+            self._model = await loop.run_in_executor(None, load_silero_vad)
+            log.info("VAD model loaded")
 
     def get_speech_prob(self, pcm_bytes: bytes) -> float:
-        """Run VAD on a single chunk and return raw speech probability (no state changes).
-
-        Silero VAD requires exactly 512 samples at 16 kHz (1024 bytes).
-        Chunks that are too short are padded with last sample; chunks that are
-        too long are truncated. Only exact 1024-byte chunks are optimal.
-        """
-        if self.model is None:
+        """Return raw speech probability for a single VAD-window chunk."""
+        if self._model is None:
             return 0.0
-        EXPECTED_BYTES = 1024  # 512 int16 samples
-        if len(pcm_bytes) < EXPECTED_BYTES:
-            # Pad with last sample value to avoid zero-silence artifacts
-            last_sample = pcm_bytes[-2:] if len(pcm_bytes) >= 2 else b'\x00\x00'
-            padding = last_sample * ((EXPECTED_BYTES - len(pcm_bytes)) // 2)
-            remainder = (EXPECTED_BYTES - len(pcm_bytes)) % 2
-            pcm_bytes = pcm_bytes + padding + (b'\x00' * remainder)
-        elif len(pcm_bytes) > EXPECTED_BYTES:
-            log.warning("[VAD] get_speech_prob: chunk too long (%d bytes), truncating to %d",
-                        len(pcm_bytes), EXPECTED_BYTES)
-            pcm_bytes = pcm_bytes[:EXPECTED_BYTES]
+        pcm_bytes = pad_to_vad_window(pcm_bytes)
         try:
             samples_np = np.frombuffer(pcm_bytes, dtype=np.int16).astype(np.float32) / 32768.0
-            if torch is not None:
-                samples = torch.from_numpy(samples_np)
-            else:
-                samples = samples_np
-            prob = self.model(samples, self.cfg.audio.input_sample_rate)
+            samples = torch.from_numpy(samples_np) if torch is not None else samples_np
+            prob = self._model(samples, self.sample_rate)
             return prob.item() if hasattr(prob, 'item') else float(prob)
         except Exception as e:
             log.error("[VAD] get_speech_prob error: %s", e)
             return 0.0
 
-    @property
-    def buffer_length(self) -> int:
-        return len(self._audio_buffer)
-
-    def get_buffer(self) -> bytes:
-        """Get accumulated speech audio and reset buffer."""
-        data = bytes(self._audio_buffer)
-        self._audio_buffer = bytearray()
-        return data
-
-    def add_chunk(self, pcm_bytes: bytes):
-        """Add audio to buffer regardless of VAD state (for manual accumulation).
-
-        Guards against unbounded growth — drops oldest audio if buffer would
-        exceed ~30 s at 16 kHz/16-bit mono (~960 KB).
-        """
-        MAX_BYTES = 960_000  # ~30 seconds
-        self._audio_buffer.extend(pcm_bytes)
-        if len(self._audio_buffer) > MAX_BYTES:
-            # Keep the most recent audio, drop oldest
-            excess = len(self._audio_buffer) - MAX_BYTES
-            del self._audio_buffer[:excess]
-            log.warning("VAD buffer overflow, dropped %d bytes of oldest audio", excess)
-
 
 def wav_header(data_length: int, sample_rate: int, channels: int = 1, bits: int = 16) -> bytes:
-    """Generate a WAV header for raw PCM data."""
     byte_rate = sample_rate * channels * bits // 8
     block_align = channels * bits // 8
-    header = struct.pack(
+    return struct.pack(
         '<4sI4s4sIHHIIHH4sI',
-        b'RIFF',
-        data_length + 36,
-        b'WAVE',
-        b'fmt ',
-        16,  # chunk size
-        1,   # PCM format
-        channels,
-        sample_rate,
-        byte_rate,
-        block_align,
-        bits,
-        b'data',
-        data_length
+        b'RIFF', data_length + 36, b'WAVE',
+        b'fmt ', 16, 1, channels, sample_rate, byte_rate, block_align, bits,
+        b'data', data_length,
     )
-    return header
 
 
 def pcm_to_wav(pcm_data: bytes, sample_rate: int, channels: int = 1, bits: int = 16) -> bytes:
-    """Wrap raw PCM data in a WAV header."""
     return wav_header(len(pcm_data), sample_rate, channels, bits) + pcm_data
 
 
 class SmartTurnDetector:
-    """End-of-turn classifier using pipecat Smart Turn v3 (audio-based ONNX).
+    """End-of-turn classifier (pipecat smart-turn-v3.2 ONNX). Lazy-loaded.
 
-    Takes raw 16kHz 16-bit mono PCM bytes and returns probability 0.0–1.0
-    that the user's conversational turn is complete.
-
-    Uses Whisper audio features as input — no transcript or conversation
-    history required.  Works correctly on the very first turn.
-
-    Falls back to 1.0 (always complete) if the model is unavailable,
-    degrading gracefully to silence-only detection.
+    Falls back to 1.0 (always complete) if the model is unavailable.
     """
 
     _MODEL_URL = (
@@ -142,11 +135,23 @@ class SmartTurnDetector:
         self._session = None
         self._extractor = None
         self._available = False
+        self._load_lock = asyncio.Lock()
 
-    def load(self):
+    @property
+    def loaded(self) -> bool:
+        return self._available
+
+    async def ensure_loaded(self):
+        if self._available:
+            return
+        async with self._load_lock:
+            if self._available:
+                return
+            await asyncio.get_running_loop().run_in_executor(None, self._load_sync)
+
+    def _load_sync(self):
         try:
             import os
-            import urllib.request
             import onnxruntime as ort
             from transformers import WhisperFeatureExtractor
 
@@ -156,40 +161,24 @@ class SmartTurnDetector:
             if not os.path.exists(model_path):
                 log.info("[SmartTurn] Downloading Smart Turn v3.2 model (~30 MB)...")
                 os.makedirs(model_dir, exist_ok=True)
-                # Use httpx with timeout instead of urlretrieve (which has no timeout)
                 import httpx
-                try:
-                    with httpx.Client(timeout=60.0) as http_client:
-                        response = http_client.get(self._MODEL_URL)
-                        response.raise_for_status()
-                        with open(model_path, "wb") as f:
-                            f.write(response.content)
-                except Exception as download_err:
-                    log.error("[SmartTurn] Model download failed: %s", download_err)
-                    raise
+                with httpx.Client(timeout=60.0) as http_client:
+                    resp = http_client.get(self._MODEL_URL)
+                    resp.raise_for_status()
+                    with open(model_path, "wb") as f:
+                        f.write(resp.content)
 
-            self._session = ort.InferenceSession(
-                model_path, providers=["CPUExecutionProvider"]
-            )
-            self._extractor = WhisperFeatureExtractor.from_pretrained(
-                "openai/whisper-tiny"
-            )
+            self._session = ort.InferenceSession(model_path, providers=["CPUExecutionProvider"])
+            self._extractor = WhisperFeatureExtractor.from_pretrained("openai/whisper-tiny")
             self._available = True
             log.info("Audio model loaded (pipecat smart-turn-v3.2)")
         except Exception as e:
-            log.warning(
-                "Could not load model (%s); "
-                "falling back to silence-only detection", e
-            )
+            log.warning("Could not load SmartTurn model (%s); falling back to silence-only detection", e)
 
     def _predict_sync(self, audio_bytes: bytes) -> float:
-        """Run inference synchronously (called via run_in_executor)."""
         try:
-            samples = (
-                np.frombuffer(audio_bytes, dtype=np.int16).astype(np.float32)
-                / 32768.0
-            )
-            samples = samples[-self._MAX_SAMPLES :]
+            samples = np.frombuffer(audio_bytes, dtype=np.int16).astype(np.float32) / 32768.0
+            samples = samples[-self._MAX_SAMPLES:]
             features = self._extractor(
                 samples,
                 sampling_rate=self._SAMPLE_RATE,
@@ -207,15 +196,10 @@ class SmartTurnDetector:
             log.debug("turn_prob=%.3f", prob)
             return prob
         except Exception as e:
-            log.warning("Inference error: %s", e)
+            log.warning("SmartTurn inference error: %s", e)
             return 1.0
 
     async def predict(self, audio_bytes: bytes) -> float:
-        """Async wrapper — runs inference in a thread pool to avoid blocking.
-
-        Args:
-            audio_bytes: Raw 16kHz 16-bit mono PCM of the complete utterance.
-        """
         if not self._available or not audio_bytes:
             return 1.0
         return await asyncio.get_running_loop().run_in_executor(
