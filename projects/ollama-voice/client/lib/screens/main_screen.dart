@@ -356,7 +356,9 @@ class _MainScreenState extends State<MainScreen> with WidgetsBindingObserver {
   Future<void> _scheduleReturnToListening() async {
     final appState = context.read<app.AppState>();
     if (!appState.wakeWordEnabled) {
-      appState.setHandsFreePhase(app.HandsFreePhase.idle);
+      // No wake word — go straight back to recording so the audio sender
+      // (gated by phase == recording) starts forwarding the next utterance.
+      appState.setHandsFreePhase(app.HandsFreePhase.recording);
       return;
     }
     // Cancel any previous stale callback before scheduling a new one.
