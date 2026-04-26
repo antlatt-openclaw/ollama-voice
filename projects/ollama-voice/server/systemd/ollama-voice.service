@@ -1,0 +1,28 @@
+# Install:
+#   sudo cp server/systemd/ollama-voice.service /etc/systemd/system/
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now ollama-voice.service
+#
+# Tail logs:
+#   journalctl -u ollama-voice -f
+#
+# Adjust paths if the project lives elsewhere on the deploy host.
+
+[Unit]
+Description=Ollama Voice Server (FastAPI WebSocket — STT/LLM/TTS)
+After=network.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/root/.openclaw/antlatt-workspace/projects/ollama-voice/server
+EnvironmentFile=/root/.openclaw/antlatt-workspace/projects/ollama-voice/server/.env
+ExecStart=/usr/bin/python3 /root/.openclaw/antlatt-workspace/projects/ollama-voice/server/main.py
+Restart=on-failure
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
