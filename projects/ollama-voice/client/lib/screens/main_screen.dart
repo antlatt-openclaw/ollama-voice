@@ -636,7 +636,7 @@ class _MainScreenState extends State<MainScreen> with WidgetsBindingObserver {
     await recorder.stopAll();
     appState.setHandsFreeListening(false);
     appState.setHandsFreePhase(app.HandsFreePhase.idle);
-    player.setAutoPlay(false);
+    player.setAutoPlay(appState.autoPlayEnabled);
     await AudioModeService.stopBluetoothSco();
     await AudioModeService.resetAudioMode();
     await _stopWakeWordListening();
