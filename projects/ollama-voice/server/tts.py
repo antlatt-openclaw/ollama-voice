@@ -78,21 +78,33 @@ async def _vibevoice(text: str, cfg: TTSConfig) -> bytes | None:
     sp = cfg.voice
 
     def _call_gradio() -> str | None:
-        client = Client(cfg.vibevoice_url, verbose=False, download_files=True)
+        # download_files=False so gradio_client doesn't try to fetch the
+        # streaming .m3u8 at output[0] (VibeVoice 403s those). We extract
+        # only output[1] (the final podcast file) and fetch it ourselves.
+        client = Client(cfg.vibevoice_url, verbose=False, download_files=False)
         result = client.predict(
             1.0, script, sp, sp, sp, sp, float(cfg.speed),
             api_name=None, fn_index=3,
         )
-        # Output shape: [streaming_file, podcast_file, log, value]
-        # Each file may be a path string, a (path, url) tuple, or a dict.
+        # Output shape: [streaming_file, podcast_update, log, value]
+        # The podcast slot is wrapped in {'visible': True, 'value': {...}}
+        # (or {'__type__': 'update', 'value': {...}} on some Gradio versions),
+        # so we unwrap before reading url/path.
         podcast = result[1] if isinstance(result, (list, tuple)) and len(result) > 1 else None
-        if podcast is None:
-            return None
         if isinstance(podcast, dict):
-            return podcast.get("path") or podcast.get("name") or podcast.get("url")
-        if isinstance(podcast, (list, tuple)):
-            return podcast[0] if podcast else None
-        return podcast  # assume str path
+            direct = podcast.get("url") or podcast.get("path")
+            if direct:
+                return direct
+            inner = podcast.get("value")
+            if isinstance(inner, dict):
+                return inner.get("url") or inner.get("path")
+            if isinstance(inner, str):
+                return inner
+        if isinstance(podcast, (list, tuple)) and podcast:
+            return podcast[0]
+        if isinstance(podcast, str):
+            return podcast
+        return None
 
     try:
         loop = asyncio.get_running_loop()
