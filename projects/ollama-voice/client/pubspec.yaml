@@ -22,6 +22,7 @@ dependencies:
 
   # Storage
   shared_preferences: ^2.2.2
+  flutter_secure_storage: ^9.0.0
   sqflite: ^2.3.0
   path: ^1.8.3
   path_provider: ^2.1.2
@@ -47,9 +48,6 @@ dependencies:
 
   # Local notifications (background response alerts + background listening indicator)
   flutter_local_notifications: ^17.0.0
-
-  # Wake word detection (optional — fallback energy-based detection is built-in)
-  porcupine_flutter: ^3.0.3
 
   # Bluetooth SCO and audio routing (Android native via MethodChannel)
   # flutter_blue_plus is used for detecting connected BT headsets

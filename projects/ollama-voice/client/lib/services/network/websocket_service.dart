@@ -2,10 +2,15 @@ import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
 import 'dart:typed_data';
+import 'package:flutter/foundation.dart' show kDebugMode;
 import 'package:web_socket_channel/io.dart';
 import 'package:uuid/uuid.dart';
 
 import '../../models/websocket_event.dart';
+
+void _debug(String msg) {
+  if (kDebugMode) print(msg);
+}
 
 class WebSocketService {
   IOWebSocketChannel? _channel;
@@ -51,40 +56,46 @@ class WebSocketService {
     await _subscription?.cancel();
     _subscription = null;
 
-    print('[WebSocket] Starting connect to: $serverUrl');
+    _debug('[WebSocket] Starting connect to: $serverUrl');
     final uri = Uri.parse(serverUrl);
     _connectionId = const Uuid().v4();
-    print('[WebSocket] Connection ID: $_connectionId');
+    _debug('[WebSocket] Connection ID: $_connectionId');
 
     try {
       // Use IOWebSocketChannel for native WebSocket on mobile
-      print('[WebSocket] Attempting WebSocket.connect...');
+      _debug('[WebSocket] Attempting WebSocket.connect...');
       final socket = await WebSocket.connect(
         uri.toString(),
         protocols: ['openclaw-voice'],
       ).timeout(const Duration(seconds: 10), onTimeout: () {
-        print('[WebSocket] Connection timeout!');
+        _debug('[WebSocket] Connection timeout!');
         throw TimeoutException('WebSocket connection timeout');
       });
-      print('[WebSocket] WebSocket connected successfully');
+      _debug('[WebSocket] WebSocket connected successfully');
       
       _channel = IOWebSocketChannel(socket);
-      print('[WebSocket] IOWebSocketChannel created');
+      _debug('[WebSocket] IOWebSocketChannel created');
 
       final completer = Completer<bool>();
 
       _subscription = _channel!.stream.listen(
         (data) {
-          print('[WebSocket] Received data: ${data is String ? data.substring(0, data.length > 100 ? 100 : data.length) : "binary"}');
+          _debug('[WebSocket] Received data: ${data is String ? data.substring(0, data.length > 100 ? 100 : data.length) : "binary"}');
           if (!completer.isCompleted) {
             if (data is String) {
-              final event = WebSocketEvent.fromJson(jsonDecode(data));
+              WebSocketEvent? event;
+              try {
+                event = WebSocketEvent.fromJson(jsonDecode(data));
+              } catch (e) {
+                _debug('[WebSocket] Failed to parse incoming JSON during auth: $e');
+                return;
+              }
               if (event.type == EventType.authOk) {
-                print('[WebSocket] Auth OK received');
+                _debug('[WebSocket] Auth OK received');
                 _authenticated = true;
                 completer.complete(true);
               } else {
-                print('[WebSocket] Unexpected event: ${event.type}');
+                _debug('[WebSocket] Unexpected event: ${event.type}');
                 completer.complete(false);
               }
               return; // auth message is not forwarded to _events
@@ -93,7 +104,7 @@ class WebSocketService {
           _handleMessage(data);
         },
         onError: (error) {
-          print('[WebSocket] Stream error: $error');
+          _debug('[WebSocket] Stream error: $error');
           if (!completer.isCompleted) {
             completer.complete(false);
           } else if (_authenticated && !_events.isClosed) {
@@ -101,7 +112,7 @@ class WebSocketService {
           }
         },
         onDone: () {
-          print('[WebSocket] Stream done (connection closed)');
+          _debug('[WebSocket] Stream done (connection closed)');
           if (!completer.isCompleted) {
             completer.complete(false);
           } else if (_authenticated && !_events.isClosed) {
@@ -121,22 +132,22 @@ class WebSocketService {
       if (agent != null) authPayload['agent'] = agent;
       // Note: system_prompt intentionally omitted — use set_config instead
       final authMsg = jsonEncode(authPayload);
-      print('[WebSocket] Sending auth message...');
+      _debug('[WebSocket] Sending auth message...');
       _channel!.sink.add(authMsg);
-      print('[WebSocket] Auth sent, waiting for response...');
+      _debug('[WebSocket] Auth sent, waiting for response...');
 
       final success = await completer.future.timeout(
         const Duration(seconds: 10),
         onTimeout: () {
-          print('[WebSocket] Auth response timeout');
+          _debug('[WebSocket] Auth response timeout');
           return false;
         },
       );
 
-      print('[WebSocket] Auth result: $success');
+      _debug('[WebSocket] Auth result: $success');
 
       if (!success) {
-        print('[WebSocket] Auth failed, closing connection');
+        _debug('[WebSocket] Auth failed, closing connection');
         await _subscription?.cancel();
         _subscription = null;
         await _channel!.sink.close();
@@ -145,11 +156,11 @@ class WebSocketService {
       }
 
       _startKeepalive();
-      print('[WebSocket] Connection established successfully');
+      _debug('[WebSocket] Connection established successfully');
       return true;
     } catch (e, stack) {
-      print('[WebSocket] Connect error: $e');
-      print('[WebSocket] Stack: $stack');
+      _debug('[WebSocket] Connect error: $e');
+      _debug('[WebSocket] Stack: $stack');
       return false;
     }
   }
@@ -165,7 +176,7 @@ class WebSocketService {
       // force a reconnect by emitting disconnected event.
       if (_lastPongTime != null &&
           DateTime.now().difference(_lastPongTime!) > const Duration(seconds: 60)) {
-        print('[WebSocket] Pong timeout — forcing reconnect');
+        _debug('[WebSocket] Pong timeout — forcing reconnect');
         _events.add(WebSocketEvent(type: EventType.disconnected));
       }
     });
@@ -173,7 +184,13 @@ class WebSocketService {
 
   void _handleMessage(dynamic data) {
     if (data is String) {
-      final event = WebSocketEvent.fromJson(jsonDecode(data));
+      WebSocketEvent event;
+      try {
+        event = WebSocketEvent.fromJson(jsonDecode(data));
+      } catch (e) {
+        _debug('[WebSocket] Failed to parse incoming JSON: $e');
+        return;
+      }
       if (event.type == EventType.pong) {
         _lastPongTime = DateTime.now();
         return;
@@ -186,10 +203,10 @@ class WebSocketService {
 
   void sendAudio(dynamic pcmData) {
     if (pcmData is Uint8List) {
-      print('[WebSocket] Sending audio: ${pcmData.length} bytes');
+      _debug('[WebSocket] Sending audio: ${pcmData.length} bytes');
       _channel?.sink.add(pcmData);
     } else {
-      print('[WebSocket] sendAudio got unexpected type: ${pcmData.runtimeType}');
+      _debug('[WebSocket] sendAudio got unexpected type: ${pcmData.runtimeType}');
     }
   }
 

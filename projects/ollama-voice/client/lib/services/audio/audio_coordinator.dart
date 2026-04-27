@@ -8,8 +8,9 @@ import 'package:permission_handler/permission_handler.dart';
 /// Unified audio coordinator that owns a single [FlutterSoundRecorder] instance
 /// and switches its output between wake-word detection and server streaming.
 ///
-/// This eliminates the race condition where [RecorderService] and [WakeWordService]
-/// both tried to open the microphone simultaneously.
+/// One mic owner avoids the race that an earlier split between separate
+/// recorder + wake-word services hit, where both tried to open the microphone
+/// simultaneously.
 class AudioCoordinator extends ChangeNotifier {
   // ── Single recorder instance ───────────────────────────────────────────────
   FlutterSoundRecorder? _recorder;
@@ -257,21 +258,41 @@ class AudioCoordinator extends ChangeNotifier {
 
   @override
   void dispose() {
-    stopAll().then((_) => _cleanupAsync()).catchError((_) {});
+    // Synchronous teardown so any in-flight callbacks (recorder.onProgress,
+    // _onWakeWordAudioChunk) hit closed-stream guards instead of racing with
+    // super.dispose(). Cancel sources first, then close sinks.
+
+    _progressSub?.cancel();          // stop new amplitude events from flowing
+    _progressSub = null;
+    _audioSub?.cancel();
+    _audioSub = null;
+
+    if (!_audioStream.isClosed) _audioStream.close();
+    if (!_amplitudeStream.isClosed) _amplitudeStream.close();
+    if (!_vadStateStream.isClosed) _vadStateStream.close();
+    if (!_errorStream.isClosed) _errorStream.close();
+    if (!_wakeWordDetectStream.isClosed) _wakeWordDetectStream.close();
+
+    // Recorder shutdown is async but we don't need to await it — the streams
+    // are already closed, so any pending events become no-ops.
+    final recorder = _recorder;
+    _recorder = null;
+    _isRecording = false;
+    _mode = AudioMode.idle;
+    if (recorder != null) {
+      unawaited(_shutdownRecorder(recorder));
+    }
+
     super.dispose();
   }
 
-  Future<void> _cleanupAsync() async {
-    await _progressSub?.cancel();
-    await _audioStream.close();
-    await _amplitudeStream.close();
-    await _vadStateStream.close();
-    await _errorStream.close();
-    await _wakeWordDetectStream.close();
-    if (_recorder != null) {
-      await _recorder!.closeRecorder();
-      _recorder = null;
-    }
+  Future<void> _shutdownRecorder(FlutterSoundRecorder recorder) async {
+    try {
+      await recorder.stopRecorder();
+    } catch (_) {}
+    try {
+      await recorder.closeRecorder();
+    } catch (_) {}
   }
 
   // ═════════════════════════════════════════════════════════════════════════
@@ -415,7 +436,7 @@ class AudioCoordinator extends ChangeNotifier {
   }
 
   // ═════════════════════════════════════════════════════════════════════════
-  //  WAKE-WORD TEMPLATES (migrated from WakeWordService)
+  //  WAKE-WORD TEMPLATES
   // ═════════════════════════════════════════════════════════════════════════
 
   static final List<List<double>> _heyOllamaTemplate = [

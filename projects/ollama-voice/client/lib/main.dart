@@ -8,6 +8,7 @@ import 'services/notification_service.dart';
 import 'providers/app_state.dart';
 import 'providers/connection_state.dart' show VoiceConnectionState;
 import 'providers/conversation_state.dart';
+import 'providers/voice_controller.dart';
 import 'services/audio/audio_coordinator.dart';
 import 'services/audio/player_service.dart';
 import 'services/audio/audio_mode_service.dart';
@@ -55,6 +56,20 @@ void main() async {
         Provider<BluetoothService>(
           create: (_) => bluetoothService,
           dispose: (_, s) => s.dispose(),
+        ),
+        // VoiceController depends on the providers above. lazy: false ensures
+        // init() runs at app startup (subscribes to lifecycle + connection).
+        ChangeNotifierProvider<VoiceController>(
+          lazy: false,
+          create: (ctx) => VoiceController(
+            appState: ctx.read<AppState>(),
+            connection: ctx.read<VoiceConnectionState>(),
+            conversation: ctx.read<ConversationState>(),
+            audio: ctx.read<AudioCoordinator>(),
+            player: ctx.read<PlayerService>(),
+            bluetooth: ctx.read<BluetoothService>(),
+            config: configService,
+          )..init(),
         ),
       ],
       child: const OpenClawVoiceApp(),

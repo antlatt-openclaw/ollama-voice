@@ -36,14 +36,14 @@ public final class GeneratedPluginRegistrant {
       Log.e(TAG, "Error registering plugin flutter_local_notifications, com.dexterous.flutterlocalnotifications.FlutterLocalNotificationsPlugin", e);
     }
     try {
+      flutterEngine.getPlugins().add(new com.it_nomads.fluttersecurestorage.FlutterSecureStoragePlugin());
+    } catch (Exception e) {
+      Log.e(TAG, "Error registering plugin flutter_secure_storage, com.it_nomads.fluttersecurestorage.FlutterSecureStoragePlugin", e);
+    }
+    try {
       flutterEngine.getPlugins().add(new xyz.canardoux.fluttersound.FlutterSound());
     } catch (Exception e) {
       Log.e(TAG, "Error registering plugin flutter_sound, xyz.canardoux.fluttersound.FlutterSound", e);
-    }
-    try {
-      flutterEngine.getPlugins().add(new ai.picovoice.flutter.voiceprocessor.FlutterVoiceProcessorPlugin());
-    } catch (Exception e) {
-      Log.e(TAG, "Error registering plugin flutter_voice_processor, ai.picovoice.flutter.voiceprocessor.FlutterVoiceProcessorPlugin", e);
     }
     try {
       flutterEngine.getPlugins().add(new dev.flutter.plugins.integration_test.IntegrationTestPlugin());
@@ -69,11 +69,6 @@ public final class GeneratedPluginRegistrant {
       flutterEngine.getPlugins().add(new com.baseflow.permissionhandler.PermissionHandlerPlugin());
     } catch (Exception e) {
       Log.e(TAG, "Error registering plugin permission_handler_android, com.baseflow.permissionhandler.PermissionHandlerPlugin", e);
-    }
-    try {
-      flutterEngine.getPlugins().add(new ai.picovoice.flutter.porcupine.PorcupinePlugin());
-    } catch (Exception e) {
-      Log.e(TAG, "Error registering plugin porcupine_flutter, ai.picovoice.flutter.porcupine.PorcupinePlugin", e);
     }
     try {
       flutterEngine.getPlugins().add(new dev.fluttercommunity.plus.share.SharePlusPlugin());

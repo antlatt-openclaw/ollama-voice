@@ -84,6 +84,12 @@ class VoiceConnectionState extends ChangeNotifier {
       return true;
     }
 
+    if (!_configService.hasAuthToken) {
+      _errorMessage = 'No auth token configured. Set one in Settings.';
+      _setStatus(ConnectionStatus.disconnected);
+      return false;
+    }
+
     print('[ConnectionState] Starting connection...');
     print('[ConnectionState] Server URL: ${_configService.serverUrl}');
     _setStatus(ConnectionStatus.connecting);
@@ -129,7 +135,11 @@ class VoiceConnectionState extends ChangeNotifier {
     }
   }
 
-  /// Manual reconnect — resets retry counter and reconnects immediately.
+  /// Tear down the current connection and reconnect immediately with a fresh
+  /// connection ID. Resets retry counter and clears any pending error.
+  ///
+  /// Used both for user-initiated reconnects (Settings, Retry button) and for
+  /// server-initiated replacements (connection_replaced event).
   Future<void> manualReconnect() async {
     _reconnectTimer?.cancel();
     _retryCount = 0;
@@ -138,17 +148,6 @@ class VoiceConnectionState extends ChangeNotifier {
     await _wsService?.disconnect();
     _wsService = null;
     _connectionId = null;
-    _setStatus(ConnectionStatus.disconnected);
-    await connect();
-  }
-
-  Future<void> reconnectWithNewConnectionId() async {
-    _reconnectTimer?.cancel();
-    _eventSub?.cancel();
-    await _wsService?.disconnect();
-    _wsService = null;
-    _connectionId = null;
-    _retryCount = 0;
     _setStatus(ConnectionStatus.disconnected);
     await connect();
   }
@@ -169,8 +168,8 @@ class VoiceConnectionState extends ChangeNotifier {
           _scheduleReconnect();
           break;
         case EventType.connectionReplaced:
-          // Another connection took over — reconnect with new ID
-          reconnectWithNewConnectionId();
+          // Another connection took over — reconnect with a fresh ID
+          manualReconnect();
           break;
         case EventType.authFailed:
           _errorMessage = 'Authentication failed';

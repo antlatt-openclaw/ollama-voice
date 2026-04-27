@@ -1,4 +1,5 @@
 import 'package:flutter/material.dart';
+import 'package:flutter_secure_storage/flutter_secure_storage.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
 class ConfigService {
@@ -26,9 +27,6 @@ class ConfigService {
   static const String _bluetoothPreferredKey = 'bluetooth_preferred';
 
   static const String _defaultServerUrl = 'wss://ollama-voice.antlatt.com/ws';
-  // ⚠️ SECURITY: This default token is a placeholder only.
-  // MUST be changed before any production or public deployment.
-  static const String _defaultAuthToken = 'ollama-voice-token-change-me';
   static const String _defaultSystemPrompt = '''You are a helpful voice assistant. Keep responses short and conversational.''';
 
   static const List<String> availableAgents = [
@@ -36,20 +34,59 @@ class ConfigService {
   ];
 
   late SharedPreferences _prefs;
+  // Auth token lives in platform secure storage (Android Keystore / iOS Keychain).
+  // We cache the loaded value so the getter can stay synchronous; SetAuthToken
+  // writes through both the cache and storage.
+  static const _secureStorage = FlutterSecureStorage(
+    aOptions: AndroidOptions(encryptedSharedPreferences: true),
+  );
+  String? _cachedAuthToken;
 
   Future<void> init() async {
     _prefs = await SharedPreferences.getInstance();
+    await _loadAuthToken();
+  }
+
+  Future<void> _loadAuthToken() async {
+    try {
+      _cachedAuthToken = await _secureStorage.read(key: _authTokenKey);
+    } catch (e) {
+      // Secure storage can fail (e.g. corrupted keystore on some Android upgrades).
+      // Fall back to no token; user re-enters via Settings.
+      debugPrint('[ConfigService] secure-storage read failed: $e');
+      _cachedAuthToken = null;
+    }
+
+    // One-time migration: if the legacy SharedPreferences entry exists and we
+    // haven't already loaded a value from secure storage, migrate it.
+    final legacy = _prefs.getString(_authTokenKey);
+    if (legacy != null && legacy.isNotEmpty && (_cachedAuthToken == null || _cachedAuthToken!.isEmpty)) {
+      _cachedAuthToken = legacy;
+      try {
+        await _secureStorage.write(key: _authTokenKey, value: legacy);
+        await _prefs.remove(_authTokenKey);
+      } catch (e) {
+        debugPrint('[ConfigService] secure-storage migrate failed: $e');
+      }
+    }
   }
 
   // ── Connection ───────────────────────────────────────────────────────────
 
   String get serverUrl => _prefs.getString(_serverUrlKey) ?? _defaultServerUrl;
-  String get authToken => _prefs.getString(_authTokenKey) ?? _defaultAuthToken;
+  String get authToken => _cachedAuthToken ?? '';
   String get systemPrompt => _prefs.getString(_systemPromptKey) ?? _defaultSystemPrompt;
-  bool get hasAuthToken => authToken.isNotEmpty && authToken != _defaultAuthToken;
+  bool get hasAuthToken => authToken.isNotEmpty;
 
   Future<void> setServerUrl(String url) => _prefs.setString(_serverUrlKey, url);
-  Future<void> setAuthToken(String token) => _prefs.setString(_authTokenKey, token);
+
+  Future<void> setAuthToken(String token) async {
+    _cachedAuthToken = token;
+    await _secureStorage.write(key: _authTokenKey, value: token);
+    // Belt-and-suspenders: ensure no stale plaintext copy lingers.
+    await _prefs.remove(_authTokenKey);
+  }
+
   Future<void> setSystemPrompt(String prompt) => _prefs.setString(_systemPromptKey, prompt);
 
   // ── Appearance ───────────────────────────────────────────────────────────
