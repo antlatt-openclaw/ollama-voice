@@ -73,61 +73,93 @@ class Config:
     audio: AudioConfig = field(default_factory=AudioConfig)
 
 
+# ── Env-var helpers ────────────────────────────────────────────────────────
+
+
+def _env_str(name: str, *, default: str = "", required: bool = False) -> str:
+    raw = os.getenv(name)
+    if not raw:
+        if required:
+            raise ValueError(f"{name} env var is required")
+        return default
+    return raw
+
+
+def _env_int(name: str, *, default: int, ge: int | None = None, le: int | None = None) -> int:
+    raw = os.getenv(name)
+    if raw is None:
+        v = default
+    else:
+        try:
+            v = int(raw)
+        except ValueError:
+            raise ValueError(f"{name} must be an integer, got {raw!r}")
+    if ge is not None and v < ge:
+        raise ValueError(f"{name} must be >= {ge}, got {v}")
+    if le is not None and v > le:
+        raise ValueError(f"{name} must be <= {le}, got {v}")
+    return v
+
+
+def _env_float(
+    name: str, *, default: float,
+    gt: float | None = None, ge: float | None = None,
+    lt: float | None = None, le: float | None = None,
+) -> float:
+    raw = os.getenv(name)
+    if raw is None:
+        v = default
+    else:
+        try:
+            v = float(raw)
+        except ValueError:
+            raise ValueError(f"{name} must be a float, got {raw!r}")
+    if gt is not None and not v > gt:
+        raise ValueError(f"{name} must be > {gt}, got {v}")
+    if ge is not None and v < ge:
+        raise ValueError(f"{name} must be >= {ge}, got {v}")
+    if lt is not None and not v < lt:
+        raise ValueError(f"{name} must be < {lt}, got {v}")
+    if le is not None and v > le:
+        raise ValueError(f"{name} must be <= {le}, got {v}")
+    return v
+
+
+# ── Loader ─────────────────────────────────────────────────────────────────
+
+
 def load_config() -> Config:
     cfg = Config()
 
-    cfg.server.auth_token = os.getenv("AUTH_TOKEN", "")
-    if not cfg.server.auth_token:
-        raise ValueError("AUTH_TOKEN env var is required")
-    if host := os.getenv("SERVER_HOST"):
-        cfg.server.host = host
-    if port := os.getenv("SERVER_PORT"):
-        cfg.server.port = int(port)
-    if cfg.server.port < 1 or cfg.server.port > 65535:
-        raise ValueError(f"SERVER_PORT must be 1-65535, got {cfg.server.port}")
-    if cfg.server.auth_timeout <= 0:
-        raise ValueError("SERVER_AUTH_TIMEOUT must be > 0")
+    cfg.server.auth_token = _env_str("AUTH_TOKEN", required=True)
+    cfg.server.host = _env_str("SERVER_HOST", default=cfg.server.host)
+    cfg.server.port = _env_int("SERVER_PORT", default=cfg.server.port, ge=1, le=65535)
 
-    cfg.stt.groq_api_key = os.getenv("GROQ_API_KEY", "")
+    cfg.stt.groq_api_key = _env_str("GROQ_API_KEY", default=cfg.stt.groq_api_key)
 
-    if url := os.getenv("OLLAMA_URL"):
-        cfg.ollama.url = url
-    if model := os.getenv("OLLAMA_MODEL"):
-        cfg.ollama.model = model
-    if cfg.ollama.timeout <= 0:
-        raise ValueError("OLLAMA_TIMEOUT must be > 0")
+    cfg.ollama.url = _env_str("OLLAMA_URL", default=cfg.ollama.url)
+    cfg.ollama.model = _env_str("OLLAMA_MODEL", default=cfg.ollama.model)
 
-    if url := os.getenv("VIBEVOICE_URL"):
-        cfg.tts.vibevoice_url = url
-    if voice := os.getenv("TTS_VOICE"):
-        cfg.tts.voice = voice
-    if speed := os.getenv("TTS_SPEED"):
-        cfg.tts.speed = float(speed)
-    if cfg.tts.speed <= 0:
-        raise ValueError(f"TTS_SPEED must be > 0, got {cfg.tts.speed}")
-    if rate := os.getenv("TTS_SAMPLE_RATE"):
-        cfg.tts.output_sample_rate = int(rate)
-    if cfg.tts.output_sample_rate < 8000 or cfg.tts.output_sample_rate > 192000:
-        raise ValueError(f"TTS_SAMPLE_RATE must be 8000-192000, got {cfg.tts.output_sample_rate}")
-    if url := os.getenv("KOKORO_URL"):
-        cfg.tts.fallback_kokoro_url = url
-    if voice := os.getenv("KOKORO_VOICE"):
-        cfg.tts.fallback_kokoro_voice = voice
-    # Hands-free overrides
-    if v := os.getenv("HF_SILENCE_MS"):
-        cfg.hands_free.silence_ms = int(v)
-    if v := os.getenv("HF_MAX_LISTEN_SECS"):
-        cfg.hands_free.max_listen_secs = int(v)
-    if v := os.getenv("HF_MIN_AUDIO_BYTES"):
-        cfg.hands_free.min_audio_bytes = int(v)
-    if v := os.getenv("HF_SMART_TURN_THRESHOLD"):
-        cfg.hands_free.smart_turn_threshold = float(v)
-    if not (0.0 <= cfg.hands_free.smart_turn_threshold <= 1.0):
-        raise ValueError(f"HF_SMART_TURN_THRESHOLD must be 0.0-1.0, got {cfg.hands_free.smart_turn_threshold}")
+    cfg.tts.vibevoice_url = _env_str("VIBEVOICE_URL", default=cfg.tts.vibevoice_url)
+    cfg.tts.voice = _env_str("TTS_VOICE", default=cfg.tts.voice)
+    cfg.tts.speed = _env_float("TTS_SPEED", default=cfg.tts.speed, gt=0)
+    cfg.tts.output_sample_rate = _env_int(
+        "TTS_SAMPLE_RATE", default=cfg.tts.output_sample_rate, ge=8000, le=192000,
+    )
+    cfg.tts.fallback_kokoro_url = _env_str("KOKORO_URL", default=cfg.tts.fallback_kokoro_url)
+    cfg.tts.fallback_kokoro_voice = _env_str("KOKORO_VOICE", default=cfg.tts.fallback_kokoro_voice)
+    cfg.tts.fallback_qwen3_url = _env_str("QWEN3_URL", default=cfg.tts.fallback_qwen3_url)
+    cfg.tts.fallback_qwen3_voice = _env_str("QWEN3_VOICE", default=cfg.tts.fallback_qwen3_voice)
 
-    if url := os.getenv("QWEN3_URL"):
-        cfg.tts.fallback_qwen3_url = url
-    if voice := os.getenv("QWEN3_VOICE"):
-        cfg.tts.fallback_qwen3_voice = voice
+    cfg.vad.speech_threshold = _env_float(
+        "VAD_SPEECH_THRESHOLD", default=cfg.vad.speech_threshold, ge=0.0, le=1.0,
+    )
+
+    cfg.hands_free.silence_ms = _env_int("HF_SILENCE_MS", default=cfg.hands_free.silence_ms)
+    cfg.hands_free.max_listen_secs = _env_int("HF_MAX_LISTEN_SECS", default=cfg.hands_free.max_listen_secs)
+    cfg.hands_free.min_audio_bytes = _env_int("HF_MIN_AUDIO_BYTES", default=cfg.hands_free.min_audio_bytes)
+    cfg.hands_free.smart_turn_threshold = _env_float(
+        "HF_SMART_TURN_THRESHOLD", default=cfg.hands_free.smart_turn_threshold, ge=0.0, le=1.0,
+    )
 
     return cfg

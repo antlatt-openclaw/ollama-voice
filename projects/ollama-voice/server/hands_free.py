@@ -3,8 +3,10 @@
 import asyncio
 import logging
 import time
+from enum import Enum
 
-from audio import VAD, VAD_SPLIT_SIZE, SmartTurnDetector
+from smart_turn import SmartTurnDetector
+from vad import VAD, VAD_SPLIT_SIZE
 from config import Config
 from models import (
     ListeningEndMessage, ListeningStartMessage, TranscriptMessage,
@@ -14,6 +16,101 @@ from session import ServerState, Session
 from stt import transcribe
 
 log = logging.getLogger("server")
+
+
+class TurnEvent(Enum):
+    NONE = "none"          # nothing of note this chunk
+    ONSET = "onset"        # speech just started — notify client
+    COMPLETE = "complete"  # turn captured, ready for STT
+    TOO_SHORT = "too_short"  # turn ended but below min_audio_bytes — discard
+
+
+class TurnCollector:
+    """VAD + silence + SmartTurn state machine for one hands-free conversation.
+
+    feed() takes one VAD-window chunk and returns (event, audio?). The caller
+    drives I/O (sending ListeningStart/End, running STT/LLM); the collector
+    just decides when a turn has begun and ended.
+    """
+
+    def __init__(self, cfg: Config, vad: VAD, smart_turn: SmartTurnDetector):
+        self._cfg = cfg
+        self._vad = vad
+        self._smart_turn = smart_turn
+        chunk_ms = (cfg.vad.window_size_samples / cfg.audio.input_sample_rate) * 1000
+        self._silence_chunks_needed = int(cfg.hands_free.silence_ms / chunk_ms)
+        self.reset()
+
+    def reset(self):
+        self._buf = bytearray()
+        self._silence_chunks = 0
+        self._collecting = False
+        self._listen_start = 0.0
+
+    @property
+    def is_collecting(self) -> bool:
+        return self._collecting
+
+    async def feed(self, chunk: bytes) -> tuple[TurnEvent, bytes | None]:
+        prob = self._vad.get_speech_prob(chunk)
+        speech_threshold = self._cfg.vad.speech_threshold
+        max_listen_secs = self._cfg.hands_free.max_listen_secs
+
+        if prob >= speech_threshold:
+            self._buf.extend(chunk)
+            if not self._collecting:
+                self._collecting = True
+                self._listen_start = time.monotonic()
+                self._silence_chunks = 0
+                return (TurnEvent.ONSET, None)
+            self._silence_chunks = 0
+            return (TurnEvent.NONE, None)
+
+        if not self._collecting:
+            return (TurnEvent.NONE, None)
+
+        self._buf.extend(chunk)
+        self._silence_chunks += 1
+        elapsed = time.monotonic() - self._listen_start
+
+        if self._silence_chunks < self._silence_chunks_needed and elapsed < max_listen_secs:
+            return (TurnEvent.NONE, None)
+
+        audio = bytes(self._buf)
+        if len(audio) < self._cfg.hands_free.min_audio_bytes:
+            self.reset()
+            return (TurnEvent.TOO_SHORT, None)
+
+        # SmartTurn gate — skipped if we hit the hard max-listen cap.
+        if elapsed < max_listen_secs:
+            turn_prob = await self._smart_turn.predict(audio)
+            if turn_prob < self._cfg.hands_free.smart_turn_threshold:
+                # Trim trailing silence so it doesn't inflate the next pass.
+                trim = self._silence_chunks * VAD_SPLIT_SIZE
+                if trim <= len(self._buf):
+                    del self._buf[-trim:]
+                self._silence_chunks = 0
+                return (TurnEvent.NONE, None)
+
+        self.reset()
+        return (TurnEvent.COMPLETE, audio)
+
+
+def _drain_queue(q: asyncio.Queue) -> int:
+    drained = 0
+    while True:
+        try:
+            q.get_nowait()
+            drained += 1
+        except asyncio.QueueEmpty:
+            break
+    return drained
+
+
+async def _abort_turn(session: Session, reason: str):
+    """Discard the current HF turn and tell the client we stopped listening."""
+    log.debug("[%s] HF abort: %s", session.conn_id, reason)
+    await session.send(ListeningEndMessage())
 
 
 async def hands_free_processor(
@@ -26,164 +123,79 @@ async def hands_free_processor(
     """Drain session.hf_audio_q, detect turns, run STT → LLM → TTS per turn."""
     assert session.hf_audio_q is not None
 
-    speech_threshold = cfg.vad.speech_threshold
-    silence_ms = cfg.hands_free.silence_ms
-    max_listen_secs = cfg.hands_free.max_listen_secs
-    min_audio_bytes = cfg.hands_free.min_audio_bytes
-    smart_turn_threshold = cfg.hands_free.smart_turn_threshold
-    chunk_ms = (cfg.vad.window_size_samples / cfg.audio.input_sample_rate) * 1000
-    silence_chunks_needed = int(silence_ms / chunk_ms)
+    collector = TurnCollector(cfg, vad, smart_turn)
+    log.info("[%s] HF processor loop starting (threshold=%.2f)",
+             session.conn_id, cfg.vad.speech_threshold)
 
-    speech_buf = bytearray()
-    silence_chunks = 0
-    is_collecting = False
-    listen_start = 0.0
-
-    log.info("[%s] HF processor loop starting (threshold=%.2f)", session.conn_id, speech_threshold)
-    prob_log_counter = 0
-
-    async def _send(msg):
-        try:
-            await session.ws.send_json(msg.model_dump())
-        except Exception as e:
-            log.warning("[%s] HF send error: %s", session.conn_id, e)
-
-    while True:
-        try:
+    try:
+        while True:
             try:
-                chunk = await asyncio.wait_for(session.hf_audio_q.get(), timeout=1.0)
-            except asyncio.TimeoutError:
-                continue
-            if chunk is None:
-                break
+                chunk = await session.hf_audio_q.get()
 
-            if session.state in (ServerState.PROCESSING, ServerState.RESPONDING):
-                # Drain queue while busy (these are likely echo of our own TTS)
-                while True:
-                    try:
-                        session.hf_audio_q.get_nowait()
-                    except asyncio.QueueEmpty:
-                        break
-                if is_collecting:
-                    is_collecting = False
-                    speech_buf = bytearray()
-                    silence_chunks = 0
-                continue
-
-            prob = vad.get_speech_prob(chunk)
-            prob_log_counter += 1
-            if prob_log_counter % 30 == 1:
-                log.debug("[%s] HF VAD prob=%.3f state=%s collecting=%s",
-                          session.conn_id, prob, session.state.name, is_collecting)
-
-            if prob >= speech_threshold:
-                if not is_collecting:
-                    is_collecting = True
-                    listen_start = time.monotonic()
-                    silence_chunks = 0
-                    await _send(ListeningStartMessage())
-                    log.debug("[%s] HF speech onset", session.conn_id)
-                else:
-                    silence_chunks = 0
-                speech_buf.extend(chunk)
-                continue
-
-            if not is_collecting:
-                continue
-
-            speech_buf.extend(chunk)
-            silence_chunks += 1
-            elapsed = time.monotonic() - listen_start
-
-            if silence_chunks < silence_chunks_needed and elapsed < max_listen_secs:
-                continue
-
-            audio_data = bytes(speech_buf)
-
-            if len(audio_data) < min_audio_bytes:
-                log.debug("[%s] HF audio too short, discarding", session.conn_id)
-                is_collecting = False
-                speech_buf = bytearray()
-                silence_chunks = 0
-                await _send(ListeningEndMessage())
-                continue
-
-            turn_prob = 1.0
-            if elapsed < max_listen_secs:
-                turn_prob = await smart_turn.predict(audio_data)
-                if turn_prob < smart_turn_threshold:
-                    log.debug("[%s] HF SmartTurn not complete (%.3f), continuing",
-                              session.conn_id, turn_prob)
-                    # Trim the silence chunks we just appended so they don't
-                    # inflate the buffer on the next iteration.
-                    trim_bytes = silence_chunks * VAD_SPLIT_SIZE
-                    if trim_bytes <= len(speech_buf):
-                        del speech_buf[-trim_bytes:]
-                    silence_chunks = 0
+                if session.state in (ServerState.PROCESSING, ServerState.RESPONDING):
+                    # Drain queue while busy (these are likely echo of our own TTS).
+                    _drain_queue(session.hf_audio_q)
+                    if collector.is_collecting:
+                        collector.reset()
                     continue
 
-            log.info("[%s] HF turn complete (prob=%.3f), STT on %d bytes",
-                     session.conn_id, turn_prob, len(audio_data))
+                event, audio = await collector.feed(chunk)
 
-            if not session.is_idle:
-                log.debug("[%s] HF state not idle (%s), discarding turn",
-                          session.conn_id, session.state.name)
-                is_collecting = False
-                speech_buf = bytearray()
-                silence_chunks = 0
-                await _send(ListeningEndMessage())
-                continue
+                if event == TurnEvent.ONSET:
+                    await session.send(ListeningStartMessage())
+                    log.debug("[%s] HF speech onset", session.conn_id)
+                    continue
 
-            transcript = await transcribe(
-                audio_data, cfg.stt, input_sample_rate=cfg.audio.input_sample_rate
-            )
+                if event == TurnEvent.TOO_SHORT:
+                    await _abort_turn(session, "audio too short")
+                    continue
 
-            is_collecting = False
-            speech_buf = bytearray()
-            silence_chunks = 0
+                if event != TurnEvent.COMPLETE:
+                    continue
 
-            if not transcript or not transcript.strip():
-                log.debug("[%s] HF empty transcript, discarding", session.conn_id)
-                await _send(ListeningEndMessage())
-                continue
+                assert audio is not None
+                log.info("[%s] HF turn complete, STT on %d bytes", session.conn_id, len(audio))
 
-            log.info("[%s] HF transcript: '%.60s'", session.conn_id, transcript)
-            await _send(ListeningEndMessage())
-            await _send(TranscriptMessage(text=transcript))
+                if not session.is_idle:
+                    await _abort_turn(session, f"state not idle ({session.state.name})")
+                    continue
 
-            if not session.is_idle:
-                log.debug("[%s] HF state changed during STT (%s), skipping generate",
-                          session.conn_id, session.state.name)
-                continue
+                transcript = await transcribe(
+                    audio, cfg.stt, input_sample_rate=cfg.audio.input_sample_rate
+                )
 
-            full_response = await generate_response(
-                session, cfg, transcript, effective_system_prompt
-            )
-            if full_response:
-                session.append_turn(transcript, full_response)
+                if not transcript or not transcript.strip():
+                    await _abort_turn(session, "empty transcript")
+                    continue
 
-            # Drain queue to discard echoed TTS audio captured by the mic.
-            drained = 0
-            while True:
-                try:
-                    session.hf_audio_q.get_nowait()
-                    drained += 1
-                except asyncio.QueueEmpty:
-                    break
-            if drained:
-                log.debug("[%s] HF drained %d echo chunks", session.conn_id, drained)
+                log.info("[%s] HF transcript: '%.60s'", session.conn_id, transcript)
+                await session.send(ListeningEndMessage())
+                await session.send(TranscriptMessage(text=transcript))
 
-        except asyncio.CancelledError:
-            raise
-        except Exception as e:
-            log.exception("[%s] HF processor exception: %s", session.conn_id, e)
-            if is_collecting:
-                try:
-                    await _send(ListeningEndMessage())
-                except Exception:
-                    pass
-            is_collecting = False
-            speech_buf = bytearray()
-            silence_chunks = 0
+                if not session.is_idle:
+                    log.debug("[%s] HF state changed during STT (%s), skipping generate",
+                              session.conn_id, session.state.name)
+                    continue
 
-    log.info("[%s] HF processor exited", session.conn_id)
+                full_response = await generate_response(
+                    session, cfg, transcript, effective_system_prompt
+                )
+                if full_response:
+                    session.append_turn(transcript, full_response)
+
+                drained = _drain_queue(session.hf_audio_q)
+                if drained:
+                    log.debug("[%s] HF drained %d echo chunks", session.conn_id, drained)
+
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                log.exception("[%s] HF processor exception: %s", session.conn_id, e)
+                if collector.is_collecting:
+                    try:
+                        await session.send(ListeningEndMessage())
+                    except Exception:
+                        pass
+                collector.reset()
+    finally:
+        log.info("[%s] HF processor exited", session.conn_id)

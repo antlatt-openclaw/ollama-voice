@@ -29,6 +29,25 @@ def _safe_load(path: Path) -> dict:
     return json.loads(path.read_text())
 
 
+def _atomic_write_json(path: Path, data: dict):
+    """Write JSON atomically: tmpfile in same dir, then os.replace."""
+    _ensure_dir()
+    tmp = tempfile.NamedTemporaryFile(
+        mode="w", dir=path.parent, delete=False, suffix=".tmp"
+    )
+    try:
+        tmp.write(json.dumps(data, indent=2))
+        tmp.close()
+        os.replace(tmp.name, path)
+    except Exception:
+        tmp.close()
+        try:
+            os.unlink(tmp.name)
+        except OSError:
+            pass
+        raise
+
+
 def load_system_prompt() -> str | None:
     """Load saved system prompt, or None if no custom prompt is saved."""
     try:
@@ -44,24 +63,10 @@ def load_system_prompt() -> str | None:
 
 def save_system_prompt(prompt: str):
     """Save a custom system prompt to disk atomically."""
-    _ensure_dir()
     try:
         data = _safe_load(SETTINGS_FILE)
         data["system_prompt"] = prompt
-        tmp = tempfile.NamedTemporaryFile(
-            mode="w", dir=DATA_DIR, delete=False, suffix=".tmp"
-        )
-        try:
-            tmp.write(json.dumps(data, indent=2))
-            tmp.close()
-            os.replace(tmp.name, SETTINGS_FILE)
-        except Exception:
-            tmp.close()
-            try:
-                os.unlink(tmp.name)
-            except OSError:
-                pass
-            raise
+        _atomic_write_json(SETTINGS_FILE, data)
         log.info("Saved system prompt (%d chars)", len(prompt))
     except Exception as e:
         log.error("Failed to save settings: %s", e)
@@ -72,25 +77,12 @@ def reset_system_prompt():
     """Delete the saved custom system prompt (revert to default)."""
     try:
         data = _safe_load(SETTINGS_FILE)
-        if "system_prompt" in data:
-            del data["system_prompt"]
-            tmp = tempfile.NamedTemporaryFile(
-                mode="w", dir=DATA_DIR, delete=False, suffix=".tmp"
-            )
-            try:
-                tmp.write(json.dumps(data, indent=2))
-                tmp.close()
-                os.replace(tmp.name, SETTINGS_FILE)
-            except Exception:
-                tmp.close()
-                try:
-                    os.unlink(tmp.name)
-                except OSError:
-                    pass
-                raise
-            log.info("Reset system prompt to default")
-        else:
+        if "system_prompt" not in data:
             log.debug("No custom system prompt to reset")
+            return
+        del data["system_prompt"]
+        _atomic_write_json(SETTINGS_FILE, data)
+        log.info("Reset system prompt to default")
     except Exception as e:
         log.error("Failed to reset settings: %s", e)
         raise

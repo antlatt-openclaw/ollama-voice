@@ -3,13 +3,20 @@
 import asyncio
 import io
 import logging
+import os
+import time
+from pathlib import Path
 import httpx
-from audio import pcm_to_wav
+from wav import pcm_to_wav
 from config import STTConfig
 
 log = logging.getLogger("stt")
 
 MAX_RETRIES = 2
+
+# Set STT_DEBUG_DIR to a directory path to dump every WAV sent to Whisper
+# for inspection. e.g. STT_DEBUG_DIR=data/debug.
+_DEBUG_DIR = os.getenv("STT_DEBUG_DIR")
 
 
 async def transcribe(audio_data: bytes, cfg: STTConfig, input_sample_rate: int = 16000, language: str = "en") -> str | None:
@@ -20,6 +27,18 @@ async def transcribe(audio_data: bytes, cfg: STTConfig, input_sample_rate: int =
 
     wav_data = pcm_to_wav(audio_data, sample_rate=input_sample_rate)
     log.info("Sending %d PCM bytes (%d WAV bytes) to Groq", len(audio_data), len(wav_data))
+
+    if _DEBUG_DIR:
+        try:
+            debug_path = Path(_DEBUG_DIR)
+            debug_path.mkdir(parents=True, exist_ok=True)
+            ts = time.strftime("%Y%m%d-%H%M%S")
+            ms = int((time.time() % 1) * 1000)
+            wav_file = debug_path / f"stt-{ts}-{ms:03d}.wav"
+            wav_file.write_bytes(wav_data)
+            log.info("Saved STT debug WAV to %s", wav_file)
+        except Exception as e:
+            log.warning("Failed to save STT debug WAV: %s", e)
 
     for attempt in range(MAX_RETRIES + 1):
         try:

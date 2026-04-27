@@ -6,7 +6,7 @@ importing common symbols from `main`.
 """
 
 from app import app, cfg  # noqa: F401  re-exported for tests
-from audio import VAD_CHUNK_SIZE, VAD_SPLIT_SIZE  # noqa: F401  re-exported for tests
+from vad import VAD_CHUNK_SIZE, VAD_SPLIT_SIZE  # noqa: F401  re-exported for tests
 from pipeline import AUDIO_CHUNK_SIZE  # noqa: F401  re-exported for tests
 from session import ServerState  # noqa: F401  re-exported for tests
 

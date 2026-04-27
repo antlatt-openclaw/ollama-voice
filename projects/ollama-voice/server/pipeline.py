@@ -15,36 +15,11 @@ from models import (
     TranscriptMessage, TtsOnlyEndMessage, TtsOnlyStartMessage,
 )
 from ollama import stream_ollama_tokens
-from session import ServerState, Session
+from session import AUDIO_CHUNK_SIZE, ServerState, Session  # noqa: F401  AUDIO_CHUNK_SIZE re-exported for tests
 from stt import transcribe
 from tts import synthesize
 
 log = logging.getLogger("server")
-
-# WebSocket binary chunk size for outgoing audio.
-AUDIO_CHUNK_SIZE = 4096
-
-
-async def _send_json(session: Session, msg):
-    if session.is_interrupted:
-        return
-    try:
-        data = msg.model_dump() if hasattr(msg, "model_dump") else msg
-        await session.ws.send_json(data)
-    except Exception as e:
-        log.warning("[%s] send_json error: %s", session.conn_id, e)
-
-
-async def _send_audio(session: Session, pcm: bytes) -> bool:
-    for i in range(0, len(pcm), AUDIO_CHUNK_SIZE):
-        if session.is_interrupted:
-            return False
-        try:
-            await session.ws.send_bytes(pcm[i:i + AUDIO_CHUNK_SIZE])
-        except Exception as e:
-            log.warning("[%s] send_audio error: %s", session.conn_id, e)
-            return False
-    return True
 
 
 async def generate_response(
@@ -56,56 +31,53 @@ async def generate_response(
     """Stream LLM tokens to client, synthesize the full reply, then stream audio."""
     log.info("[%s] generate_response text='%.60s' history=%d",
              session.conn_id, text, len(session.history))
-    await session.to_state(ServerState.RESPONDING)
 
-    await _send_json(session, ResponseStartMessage(text=""))
+    async with session.in_state(ServerState.RESPONDING):
+        await session.send_if_active(ResponseStartMessage(text=""))
 
-    full_response = ""
-    try:
-        async for delta, accumulated in stream_ollama_tokens(
-            text, cfg.ollama,
-            system_prompt=effective_system_prompt,
-            history=session.history_snapshot(),
-        ):
-            if session.is_interrupted:
-                break
-            full_response = accumulated
-            await _send_json(session, ResponseDeltaMessage(text=delta))
-    except Exception as e:
-        log.error("[%s] LLM streaming error: %s", session.conn_id, e)
+        full_response = ""
+        error_detail: str | None = None
+        try:
+            async for delta, accumulated in stream_ollama_tokens(
+                text, cfg.ollama,
+                system_prompt=effective_system_prompt,
+                history=session.history_snapshot(),
+            ):
+                if session.is_interrupted:
+                    break
+                full_response = accumulated
+                await session.send_if_active(ResponseDeltaMessage(text=delta))
+        except Exception as e:
+            error_detail = str(e) or e.__class__.__name__
+            log.error("[%s] LLM streaming error: %s", session.conn_id, error_detail)
 
-    if session.is_interrupted:
-        log.debug("[%s] interrupted during LLM", session.conn_id)
-        await session.to_state(ServerState.IDLE)
-        return None
+        if session.is_interrupted:
+            log.debug("[%s] interrupted during LLM", session.conn_id)
+            return None
 
-    if not full_response.strip():
-        await _send_json(session, ErrorMessage(message="No response from Ollama"))
-        await session.to_state(ServerState.IDLE)
-        return None
+        if not full_response.strip():
+            await session.send_if_active(ErrorMessage(message=error_detail or "No response from Ollama"))
+            return None
 
-    log.info("[%s] synthesizing full response (%d chars)", session.conn_id, len(full_response.strip()))
-    audio = await synthesize(full_response.strip(), cfg.tts)
+        log.info("[%s] synthesizing full response (%d chars)", session.conn_id, len(full_response.strip()))
+        audio = await synthesize(full_response.strip(), cfg.tts)
 
-    if session.is_interrupted:
-        log.debug("[%s] interrupted during TTS, dropping audio", session.conn_id)
-        await session.to_state(ServerState.IDLE)
-        return None
+        if session.is_interrupted:
+            log.debug("[%s] interrupted during TTS, dropping audio", session.conn_id)
+            return None
 
-    if audio:
-        duration_ms = int(len(audio) / (cfg.tts.output_sample_rate * 2) * 1000)
-        await _send_json(session, AudioStartMessage(duration_ms=duration_ms))
-        if await _send_audio(session, audio):
-            await _send_json(session, AudioEndMessage())
+        if audio:
+            duration_ms = int(len(audio) / (cfg.tts.output_sample_rate * 2) * 1000)
+            await session.send_if_active(AudioStartMessage(duration_ms=duration_ms))
+            if await session.send_audio(audio):
+                await session.send_if_active(AudioEndMessage())
 
-    if session.is_interrupted:
-        await session.to_state(ServerState.IDLE)
-        return None
+        if session.is_interrupted:
+            return None
 
-    await _send_json(session, ResponseEndMessage(text=full_response))
-    log.info("[%s] response complete: %.80s", session.conn_id, full_response)
-    await session.to_state(ServerState.IDLE)
-    return full_response
+        await session.send_if_active(ResponseEndMessage(text=full_response))
+        log.info("[%s] response complete: %.80s", session.conn_id, full_response)
+        return full_response
 
 
 async def process_speech(
@@ -115,32 +87,39 @@ async def process_speech(
     effective_system_prompt: str,
 ):
     """Full PTT turn: STT → LLM → TTS."""
-    await session.to_state(ServerState.PROCESSING)
-
-    log.info("[%s] transcribing %d bytes of audio", session.conn_id, len(audio_data))
-    try:
-        text = await transcribe(audio_data, cfg.stt, input_sample_rate=cfg.audio.input_sample_rate)
-    except Exception as e:
-        log.error("[%s] STT error: %s", session.conn_id, e)
-        await _send_json(session, ErrorMessage(message="Transcription failed"))
-        await session.to_state(ServerState.IDLE)
+    text = await _do_stt(session, cfg, audio_data)
+    if text is None:
         return
-
-    if not text:
-        await _send_json(session, ErrorMessage(message="Could not transcribe audio"))
-        await session.to_state(ServerState.IDLE)
-        return
-
-    await _send_json(session, TranscriptMessage(text=text))
-    log.info("[%s] transcribed: %s", session.conn_id, text)
-
-    if session.is_interrupted:
-        await session.to_state(ServerState.IDLE)
-        return
-
     full_response = await generate_response(session, cfg, text, effective_system_prompt)
     if full_response:
         session.append_turn(text, full_response)
+
+
+async def _do_stt(session: Session, cfg: Config, audio_data: bytes) -> str | None:
+    """STT phase of process_speech. Returns transcript or None if no usable result.
+
+    Owns the PROCESSING state and sends the user-facing TranscriptMessage on success.
+    """
+    async with session.in_state(ServerState.PROCESSING):
+        log.info("[%s] transcribing %d bytes of audio", session.conn_id, len(audio_data))
+        try:
+            text = await transcribe(audio_data, cfg.stt, input_sample_rate=cfg.audio.input_sample_rate)
+        except Exception as e:
+            log.error("[%s] STT error: %s", session.conn_id, e)
+            await session.send_if_active(ErrorMessage(message="Transcription failed"))
+            return None
+
+        if not text:
+            await session.send_if_active(ErrorMessage(message="Could not transcribe audio"))
+            return None
+
+        await session.send_if_active(TranscriptMessage(text=text))
+        log.info("[%s] transcribed: %s", session.conn_id, text)
+
+        if session.is_interrupted:
+            return None
+
+        return text
 
 
 async def handle_tts_only(session: Session, cfg: Config, text: str):
@@ -149,16 +128,15 @@ async def handle_tts_only(session: Session, cfg: Config, text: str):
         log.info("[%s] TTS-only ignored — busy (%s)", session.conn_id, session.state.value)
         return
 
-    await session.to_state(ServerState.RESPONDING)
     log.info("[%s] TTS-only: %.60s", session.conn_id, text)
-    try:
-        await _send_json(session, TtsOnlyStartMessage())
-        audio = await synthesize(text, cfg.tts)
-        if audio is not None and not session.is_interrupted:
-            duration_ms = int(len(audio) / (cfg.tts.output_sample_rate * 2) * 1000)
-            await _send_json(session, AudioStartMessage(duration_ms=duration_ms))
-            if await _send_audio(session, audio):
-                await _send_json(session, AudioEndMessage())
-    finally:
-        await session.to_state(ServerState.IDLE)
-        await _send_json(session, TtsOnlyEndMessage())
+    async with session.in_state(ServerState.RESPONDING):
+        try:
+            await session.send_if_active(TtsOnlyStartMessage())
+            audio = await synthesize(text, cfg.tts)
+            if audio is not None and not session.is_interrupted:
+                duration_ms = int(len(audio) / (cfg.tts.output_sample_rate * 2) * 1000)
+                await session.send_if_active(AudioStartMessage(duration_ms=duration_ms))
+                if await session.send_audio(audio):
+                    await session.send_if_active(AudioEndMessage())
+        finally:
+            await session.send_if_active(TtsOnlyEndMessage())

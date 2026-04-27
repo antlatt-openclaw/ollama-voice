@@ -1,9 +1,15 @@
-"""TTS integration — VibeVoice (gradio_client) primary, Kokoro/Qwen3 fallback."""
+"""TTS integration — provider-based fallback chain.
+
+Default chain: VibeVoice (primary, gradio_client) → Kokoro → Qwen3
+(both OpenAI-compatible /v1/audio/speech backends).
+"""
 
 import asyncio
 import logging
 import re
 import struct
+from dataclasses import dataclass
+from typing import Protocol
 import httpx
 from config import TTSConfig
 
@@ -14,6 +20,178 @@ MAX_TTS_CHARS = 4000
 # Per-attempt timeout for the VibeVoice gradio call. The Gradio server itself
 # may queue, but we don't want to block a user for minutes if it's stuck.
 VIBEVOICE_TIMEOUT_S = 90.0
+
+
+# ── Provider protocol ────────────────────────────────────────────────────
+
+
+class TTSProvider(Protocol):
+    name: str
+
+    async def synthesize(self, text: str, cfg: TTSConfig) -> bytes | None: ...
+
+
+# ── VibeVoice (primary) ──────────────────────────────────────────────────
+
+
+class VibeVoiceProvider:
+    name = "VibeVoice"
+
+    async def synthesize(self, text: str, cfg: TTSConfig) -> bytes | None:
+        try:
+            from gradio_client import Client
+        except ImportError:
+            log.error("gradio_client not installed; cannot reach VibeVoice")
+            return None
+
+        script = f"Speaker 1: {text}"
+        sp = cfg.voice
+
+        def _call_gradio() -> str | None:
+            # download_files=False so gradio_client doesn't try to fetch the
+            # streaming .m3u8 at output[0] (VibeVoice 403s those). We extract
+            # only output[1] (the final podcast file) and fetch it ourselves.
+            client = Client(cfg.vibevoice_url, verbose=False, download_files=False)
+            result = client.predict(
+                1.0, script, sp, sp, sp, sp, float(cfg.speed),
+                api_name=None, fn_index=3,
+            )
+            # Output shape: [streaming_file, podcast_update, log, value]
+            # The podcast slot is wrapped in {'visible': True, 'value': {...}}
+            # (or {'__type__': 'update', 'value': {...}} on some Gradio versions),
+            # so we unwrap before reading url/path.
+            podcast = result[1] if isinstance(result, (list, tuple)) and len(result) > 1 else None
+            if isinstance(podcast, dict):
+                direct = podcast.get("url") or podcast.get("path")
+                if direct:
+                    return direct
+                inner = podcast.get("value")
+                if isinstance(inner, dict):
+                    return inner.get("url") or inner.get("path")
+                if isinstance(inner, str):
+                    return inner
+            if isinstance(podcast, (list, tuple)) and podcast:
+                return podcast[0]
+            if isinstance(podcast, str):
+                return podcast
+            return None
+
+        try:
+            loop = asyncio.get_running_loop()
+            path = await asyncio.wait_for(
+                loop.run_in_executor(None, _call_gradio),
+                timeout=VIBEVOICE_TIMEOUT_S,
+            )
+        except asyncio.TimeoutError:
+            log.error("VibeVoice timeout after %.0fs", VIBEVOICE_TIMEOUT_S)
+            return None
+        except Exception as e:
+            log.error("VibeVoice gradio_client error: %s", e)
+            return None
+
+        if not path:
+            log.warning("VibeVoice returned no file path")
+            return None
+
+        audio_bytes = await _read_audio(path, cfg.vibevoice_url)
+        if audio_bytes is None:
+            return None
+
+        pcm = await _audio_to_pcm(audio_bytes, target_rate=cfg.output_sample_rate)
+        if pcm:
+            log.info("VibeVoice: %d bytes PCM (%.2fs @ %dHz)",
+                     len(pcm), len(pcm) / (cfg.output_sample_rate * 2), cfg.output_sample_rate)
+        return pcm
+
+
+# ── OpenAI-compatible /v1/audio/speech (Kokoro, Qwen3, etc.) ─────────────
+
+
+@dataclass
+class OpenAICompatProvider:
+    """Generic /v1/audio/speech client. One instance per backend (Kokoro, Qwen3, ...)."""
+    name: str
+    base_url: str
+    model: str
+    voice: str
+    timeout: float = 60.0
+
+    async def synthesize(self, text: str, cfg: TTSConfig) -> bytes | None:
+        url = f"{self.base_url}/v1/audio/speech"
+        try:
+            async with httpx.AsyncClient(timeout=self.timeout) as client:
+                resp = await client.post(
+                    url,
+                    json={"model": self.model, "input": text, "voice": self.voice, "response_format": "wav"},
+                )
+                resp.raise_for_status()
+                return await _audio_to_pcm(resp.content, target_rate=cfg.output_sample_rate)
+        except httpx.HTTPStatusError as e:
+            log.error("%s HTTP %d: %s", self.name, e.response.status_code, e)
+        except (httpx.ConnectError, httpx.TimeoutException, httpx.NetworkError) as e:
+            log.error("%s connection error: %s", self.name, e)
+        except Exception as e:
+            log.error("%s unexpected error: %s", self.name, e)
+        return None
+
+
+def default_providers(cfg: TTSConfig) -> list[TTSProvider]:
+    """Default fallback chain built from cfg."""
+    return [
+        VibeVoiceProvider(),
+        OpenAICompatProvider(
+            name="Kokoro",
+            base_url=cfg.fallback_kokoro_url,
+            model="kokoro",
+            voice=cfg.fallback_kokoro_voice,
+        ),
+        OpenAICompatProvider(
+            name="Qwen3",
+            base_url=cfg.fallback_qwen3_url,
+            model="qwen3-tts",
+            voice=cfg.fallback_qwen3_voice,
+        ),
+    ]
+
+
+# ── Public entry point ───────────────────────────────────────────────────
+
+
+async def synthesize(
+    text: str,
+    cfg: TTSConfig,
+    providers: list[TTSProvider] | None = None,
+) -> bytes | None:
+    """Synthesize speech via the provider chain. First non-None result wins.
+
+    Returns cfg.output_sample_rate Hz 16-bit mono PCM bytes, or None on failure.
+    Pass `providers=` to inject a custom chain (e.g. for tests).
+    """
+    if providers is None:
+        providers = default_providers(cfg)
+
+    if len(text) > MAX_TTS_CHARS:
+        log.warning("TTS text too long (%d chars), truncating to %d", len(text), MAX_TTS_CHARS)
+        text = text[:MAX_TTS_CHARS]
+    clean = _clean_text(text)
+    if not clean:
+        log.warning("TTS text empty after cleaning, skipping")
+        return None
+
+    log.info("TTS synthesizing %d chars (voice=%s, speed=%.1f)", len(clean), cfg.voice, cfg.speed)
+
+    for provider in providers:
+        result = await provider.synthesize(clean, cfg)
+        if result is not None:
+            log.info("%s TTS success: %d bytes PCM", provider.name, len(result))
+            return result
+        log.warning("%s returned None, trying next fallback", provider.name)
+
+    log.error("All TTS providers failed")
+    return None
+
+
+# ── Helpers ──────────────────────────────────────────────────────────────
 
 
 def _clean_text(text: str) -> str:
@@ -36,104 +214,6 @@ def _clean_text(text: str) -> str:
     return re.sub(r'\s+', ' ', clean).strip()
 
 
-async def synthesize(text: str, cfg: TTSConfig) -> bytes | None:
-    """Synthesize speech — VibeVoice → Kokoro → Qwen3 fallback chain.
-
-    Returns cfg.output_sample_rate Hz 16-bit mono PCM bytes, or None on failure.
-    """
-    if len(text) > MAX_TTS_CHARS:
-        log.warning("TTS text too long (%d chars), truncating to %d", len(text), MAX_TTS_CHARS)
-        text = text[:MAX_TTS_CHARS]
-    clean = _clean_text(text)
-    if not clean:
-        log.warning("TTS text empty after cleaning, skipping")
-        return None
-
-    log.info("TTS synthesizing %d chars (voice=%s, speed=%.1f)", len(clean), cfg.voice, cfg.speed)
-
-    for label, fn in (("VibeVoice", _vibevoice), ("Kokoro", _kokoro), ("Qwen3", _qwen3)):
-        result = await fn(clean, cfg)
-        if result is not None:
-            log.info("%s TTS success: %d bytes PCM", label, len(result))
-            return result
-        log.warning("%s returned None, trying next fallback", label)
-
-    log.error("All TTS providers failed")
-    return None
-
-
-async def _vibevoice(text: str, cfg: TTSConfig) -> bytes | None:
-    """VibeVoice via gradio_client. fn_index=3 (generate_podcast_wrapper).
-
-    The Gradio server returns a tuple including a podcast file path. We read
-    the file, decode to PCM at the configured sample rate, and return.
-    """
-    try:
-        from gradio_client import Client
-    except ImportError:
-        log.error("gradio_client not installed; cannot reach VibeVoice")
-        return None
-
-    script = f"Speaker 1: {text}"
-    sp = cfg.voice
-
-    def _call_gradio() -> str | None:
-        # download_files=False so gradio_client doesn't try to fetch the
-        # streaming .m3u8 at output[0] (VibeVoice 403s those). We extract
-        # only output[1] (the final podcast file) and fetch it ourselves.
-        client = Client(cfg.vibevoice_url, verbose=False, download_files=False)
-        result = client.predict(
-            1.0, script, sp, sp, sp, sp, float(cfg.speed),
-            api_name=None, fn_index=3,
-        )
-        # Output shape: [streaming_file, podcast_update, log, value]
-        # The podcast slot is wrapped in {'visible': True, 'value': {...}}
-        # (or {'__type__': 'update', 'value': {...}} on some Gradio versions),
-        # so we unwrap before reading url/path.
-        podcast = result[1] if isinstance(result, (list, tuple)) and len(result) > 1 else None
-        if isinstance(podcast, dict):
-            direct = podcast.get("url") or podcast.get("path")
-            if direct:
-                return direct
-            inner = podcast.get("value")
-            if isinstance(inner, dict):
-                return inner.get("url") or inner.get("path")
-            if isinstance(inner, str):
-                return inner
-        if isinstance(podcast, (list, tuple)) and podcast:
-            return podcast[0]
-        if isinstance(podcast, str):
-            return podcast
-        return None
-
-    try:
-        loop = asyncio.get_running_loop()
-        path = await asyncio.wait_for(
-            loop.run_in_executor(None, _call_gradio),
-            timeout=VIBEVOICE_TIMEOUT_S,
-        )
-    except asyncio.TimeoutError:
-        log.error("VibeVoice timeout after %.0fs", VIBEVOICE_TIMEOUT_S)
-        return None
-    except Exception as e:
-        log.error("VibeVoice gradio_client error: %s", e)
-        return None
-
-    if not path:
-        log.warning("VibeVoice returned no file path")
-        return None
-
-    audio_bytes = await _read_audio(path, cfg.vibevoice_url)
-    if audio_bytes is None:
-        return None
-
-    pcm = await _audio_to_pcm(audio_bytes, target_rate=cfg.output_sample_rate)
-    if pcm:
-        log.info("VibeVoice: %d bytes PCM (%.2fs @ %dHz)",
-                 len(pcm), len(pcm) / (cfg.output_sample_rate * 2), cfg.output_sample_rate)
-    return pcm
-
-
 async def _read_audio(path_or_url: str, server_url: str) -> bytes | None:
     """Read audio bytes from a local file path (gradio_client downloads it)
     or, if it's an HTTP URL, fetch it directly."""
@@ -145,7 +225,6 @@ async def _read_audio(path_or_url: str, server_url: str) -> bytes | None:
     else:
         # Local downloaded path
         try:
-            import os
             with open(path_or_url, "rb") as f:
                 return f.read()
         except Exception as e:
@@ -160,52 +239,6 @@ async def _read_audio(path_or_url: str, server_url: str) -> bytes | None:
     except Exception as e:
         log.error("Failed to fetch VibeVoice audio from %s: %s", url, e)
         return None
-
-
-async def _kokoro(text: str, cfg: TTSConfig) -> bytes | None:
-    return await _openai_tts(
-        text, cfg,
-        url=f"{cfg.fallback_kokoro_url}/v1/audio/speech",
-        model="kokoro",
-        voice=cfg.fallback_kokoro_voice,
-        label="Kokoro",
-    )
-
-
-async def _qwen3(text: str, cfg: TTSConfig) -> bytes | None:
-    return await _openai_tts(
-        text, cfg,
-        url=f"{cfg.fallback_qwen3_url}/v1/audio/speech",
-        model="qwen3-tts",
-        voice=cfg.fallback_qwen3_voice,
-        label="Qwen3",
-    )
-
-
-async def _openai_tts(
-    text: str,
-    cfg: TTSConfig,
-    url: str,
-    model: str,
-    voice: str,
-    label: str,
-) -> bytes | None:
-    """Shared OpenAI-compatible /v1/audio/speech client for Kokoro and Qwen3."""
-    try:
-        async with httpx.AsyncClient(timeout=60.0) as client:
-            resp = await client.post(
-                url,
-                json={"model": model, "input": text, "voice": voice, "response_format": "wav"},
-            )
-            resp.raise_for_status()
-            return await _audio_to_pcm(resp.content, target_rate=cfg.output_sample_rate)
-    except httpx.HTTPStatusError as e:
-        log.error("%s HTTP %d: %s", label, e.response.status_code, e)
-    except (httpx.ConnectError, httpx.TimeoutException, httpx.NetworkError) as e:
-        log.error("%s connection error: %s", label, e)
-    except Exception as e:
-        log.error("%s unexpected error: %s", label, e)
-    return None
 
 
 def _find_wav_data_chunk(audio_data: bytes) -> tuple[int, int] | None:

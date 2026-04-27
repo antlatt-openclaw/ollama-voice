@@ -1,16 +1,95 @@
 """Pydantic models for WebSocket messages."""
 
-from typing import Literal
-from pydantic import BaseModel
+from typing import Annotated, Literal, Union
+from pydantic import BaseModel, ConfigDict, Field, TypeAdapter, ValidationError
 
 
-class AuthMessage(BaseModel):
-    type: str = "auth"
+# ── Incoming messages ────────────────────────────────────────────────────
+# All incoming messages use Literal `type` so a discriminated union can
+# parse them in one shot. Unknown fields are ignored so the wire format
+# stays forward-compatible.
+
+
+class _Incoming(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+
+
+class AuthMessage(_Incoming):
+    type: Literal["auth"] = "auth"
     token: str
     connection_id: str | None = None
     agent: str | None = None
     mode: Literal["ptt", "hands_free"] = "ptt"
     system_prompt: str | None = None  # None = use server default
+
+
+class InterruptMessage(_Incoming):
+    type: Literal["interrupt"] = "interrupt"
+    request_id: str = ""
+
+
+class EndRecordingMessage(_Incoming):
+    type: Literal["end_recording"] = "end_recording"
+    history: list | None = None  # deprecated — server owns history
+
+
+class TtsRequestMessage(_Incoming):
+    type: Literal["tts_request"] = "tts_request"
+    text: str = ""
+
+
+class TextQueryMessage(_Incoming):
+    type: Literal["text_query"] = "text_query"
+    text: str = ""
+    history: list | None = None  # deprecated — server owns history
+
+
+class PingMessage(_Incoming):
+    type: Literal["ping"] = "ping"
+
+
+class GetConfigMessage(_Incoming):
+    type: Literal["get_config"] = "get_config"
+
+
+class SetConfigMessage(_Incoming):
+    type: Literal["set_config"] = "set_config"
+    system_prompt: str | None = None  # None = reset to default
+
+
+IncomingTextMessage = Annotated[
+    Union[
+        InterruptMessage,
+        EndRecordingMessage,
+        TtsRequestMessage,
+        TextQueryMessage,
+        PingMessage,
+        GetConfigMessage,
+        SetConfigMessage,
+    ],
+    Field(discriminator="type"),
+]
+
+_text_adapter: TypeAdapter[IncomingTextMessage] = TypeAdapter(IncomingTextMessage)
+
+
+def parse_text_message(data: dict) -> IncomingTextMessage:
+    """Parse an incoming text-frame dict into a typed message.
+
+    Raises pydantic.ValidationError on unknown type or missing required fields.
+    """
+    return _text_adapter.validate_python(data)
+
+
+def parse_auth_message(data: dict) -> AuthMessage:
+    """Parse an incoming auth-handshake dict into an AuthMessage.
+
+    Raises pydantic.ValidationError on missing token / wrong shape.
+    """
+    return AuthMessage.model_validate(data)
+
+
+# ── Outgoing messages ────────────────────────────────────────────────────
 
 
 class AuthOkMessage(BaseModel):
