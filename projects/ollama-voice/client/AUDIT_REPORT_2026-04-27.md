@@ -1,7 +1,17 @@
 # Ollama-Voice Flutter Client — Audit (2026-04-27)
 
+> ⚠️ **PARTIALLY STALE (2026-04-27 morning).** This report was written before
+> commits `ea3ede61` (server refactor + 135 tests) and `baea2d40` (client
+> HandsFreeController + secure storage + bug fixes + dead-code purge) landed
+> the same day. Many "critical issues" and "real bugs" listed below are now
+> resolved — see the [Resolution Status](#resolution-status-as-of-2026-04-27-evening)
+> section directly under the Executive Summary for the current picture. The
+> body of the report is preserved verbatim as a snapshot of what was true at
+> the moment of writing; do not treat its severity scores or open-issue lists
+> as live state without consulting the resolution table.
+
 **Auditor:** Claude (collaborative session with Anthony)
-**Date:** 2026-04-27
+**Date:** 2026-04-27 (morning snapshot — see banner above for what changed since)
 **Scope:** All `lib/*.dart` (23 files, ~5,200 lines), `pubspec.yaml`
 **Method:** Full-file reads + targeted greps. Findings cite `file:line` against
 the working tree as of this date. Cross-references to the prior 2026-04-25 audit
@@ -47,6 +57,75 @@ race) is **not actually fixed in code**. Several hundred lines of dead code
    subscriptions, 4 booleans + an enum to track HF state, and direct
    orchestration of audio recording, WS comms, Bluetooth, proximity, wake-word,
    notifications, and rendering.
+
+---
+
+## Resolution Status (as of 2026-04-27 evening)
+
+The audit body below was written before commits `ea3ede61` (server) and
+`baea2d40` (client) landed the same day. This section maps each finding to
+its current state. Anything not listed here is still open or explicitly
+deferred — the body of the report remains the authoritative description.
+
+### Resolved by today's commits
+
+| Audit ID | Finding | Resolution |
+|---|---|---|
+| **C1** | Hardcoded default auth token (`'ollama-voice-token-change-me'`) | Removed. `authToken` getter returns `''` when unset; `connect()` refuses to attempt with no token and surfaces a clear error. |
+| **C2** | Auth token in plaintext `SharedPreferences` | Migrated to `flutter_secure_storage` 9.x with Android `encryptedSharedPreferences: true`. One-time silent migration from legacy storage on first launch. |
+| **C4** | Malformed JSON crashes the app | Both `jsonDecode` sites in `WebSocketService` now `try/catch` and drop the frame on `FormatException`. |
+| **C5** | `AudioCoordinator.dispose()` async-fire-and-forget race | Synchronous teardown: subs cancelled and stream controllers closed before `super.dispose()`; recorder shutdown via `unawaited()` after streams are closed so any late callbacks become no-ops. |
+| **A1** | `MainScreen` god widget (1,066 lines, 9 subs, mixed concerns) | `VoiceController` extracted (`lib/providers/voice_controller.dart`, ~800 lines). `_MainScreenState` body is now ~265 lines of UI-only code. (Note: `main_screen.dart` file is still 929 lines because of inline widget classes `_ConversationDrawer`, `_LatencyOverlay`, `_SettingsSheet` that weren't part of the god-widget concern.) |
+| **A6** | `manualReconnect` / `reconnectWithNewConnectionId` near-duplicates | Merged into `manualReconnect`; `connection_replaced` event handler now calls it directly. |
+| **DC1** | `RecorderService` (192 lines) unused | Deleted. |
+| **DC2** | `WakeWordService` (440 lines) unused | Deleted. |
+| **DC3** | `_stopWakeWordListeningOnly` duplicate of `_stopWakeWordListening` | Deleted. |
+| **DC4** | Unused `final appState = …` local in `_onConnectionStateChanged` | Removed. (Side note: this dead-code line was the original developer's intent-marker for a HF-toggle bug fix; once removed, the underlying bug surfaced and was also fixed — see "New finding" below.) |
+| **DC6** | `porcupine_flutter` declared but unused | Removed from `pubspec.yaml`. Saved ~10 MB of bundled ML model assets. |
+| **L2** | `_startHandsFreeStreaming` partial-failure leaves recorder running | Catch path now tears down recorder + Bluetooth SCO + audio mode before rethrowing. |
+| **Q3** | Verbose `print()` on every WS frame in production | All 25 sites in `WebSocketService` now gated on `kDebugMode`. |
+| **Q4** | Server URL has no validation | Settings dialog rejects invalid input inline (must `Uri.tryParse`, have non-empty host, scheme in `{ws, wss, http, https}`). |
+
+### New finding surfaced and fixed during the controller refactor
+
+- **HF toggle didn't start the mic until app-resume.** A pre-existing gap
+  (the dead-code DC4 line was the original developer's intent-marker for
+  this fix). `_onConnectionStateChanged` now starts HF streaming when
+  connected AND `handsFreeEnabled`. Idempotent. Verified by manual test
+  (path #3).
+
+### Still open or explicitly deferred
+
+| Audit ID | Status | Note |
+|---|---|---|
+| **C3** TLS pinning | Deferred | Overkill for personal-use deployment. Revisit if shipping to others. |
+| **C6** Auth handshake brittle | Open | Listener treats first non-`auth_ok` event as failure. Defensive issue, not a known live bug. |
+| **A2** 5-way HF state split | Partial | Fields moved into `VoiceController`; consolidation into a single phase enum still pending. |
+| **A3** Homegrown DTW wake-word matcher | Open | `porcupine_flutter` was removed without a replacement. Decision deferred: keep the DTW matcher, integrate `sherpa-onnx` keyword spotting, or accept the current accuracy. |
+| **A4** PlayerService dual notification API (`onPlaybackEnded` callback + `playbackCompleteStream`) | Open | Pick one — the stream is the canonical pattern. |
+| **A5** Stream-controller defensive `if (!_stream.isClosed)` checks | Partially mitigated | The dispose race fix (C5) removed the underlying cause, but the defensive checks remain. Could remove most of them. |
+| **L1** `BuildContext` after async without `mounted` checks | Mostly resolved | The big offender (`MainScreen`) is now thin; remaining sites are in the Settings sheet. |
+| **L3** `_eventChain` swallows sync exceptions | Open | `Future.then().catchError()` only catches async errors; pre-await throws escape. Wrap in `try/catch` or `Future.sync(() => …)`. |
+| **L4** `audio_session` vs MethodChannel mode conflict | Open | Two APIs touching the same Android audio mode. |
+| **L5** Bluetooth continuous scan | Open | Battery cost. |
+| **Q1** No client-side audio backpressure | Deferred | Needs sink-rewrite (`WebSocket.done` per-chunk or pause-the-source). Not a real-world problem under current network conditions. |
+| **Q2** `connection_id` rotates per reconnect | Open (design choice) | Server can't dedupe reconnects from the same client. Fix would be to persist + reuse the UUID with a TTL. |
+| **Q5** Magic numbers throughout | Open | Cosmetic until tuning is needed. |
+| **Q6** SQLite no migration path | Open | Schema changes will require a wipe. Add `onUpgrade` when adding fields. |
+| **Q7** `bufferChunk` drops silently on overflow | Open | Per-chunk log; should escalate to UI error so users know audio was clipped. |
+
+### Updated scores (post-commits)
+
+| Metric | Before | After | Δ |
+|---|---|---|---|
+| Overall health | 66/100 | ~80/100 | +14 |
+| Code correctness | 60 | 80 | +20 (C4, C5, HF-toggle bug all fixed) |
+| Security | 40 | 75 | +35 (C1, C2 fixed; C3 deferred) |
+| Architecture | 55 | 75 | +20 (A1 controller extraction; A6 dedup) |
+| Async/lifecycle | 65 | 75 | +10 (L2 fixed, L1 mostly resolved by controller move) |
+| Dependencies | 70 | 80 | +10 (porcupine removed; flutter_secure_storage added) |
+| Dead code | 55 | 95 | +40 (632 lines removed) |
+| Server↔client wire contract | 95 | 95 | unchanged |
 
 ---
 
